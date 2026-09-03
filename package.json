@@ -1,0 +1,18 @@
+{
+  "name": "yuque-export",
+  "version": "0.1.0",
+  "description": "语雀知识库导出工具：保持目录结构导出为 Markdown，图片附件本地化到笔记同名 .assets 目录，支持增量同步（无需语雀会员）",
+  "type": "module",
+  "bin": {
+    "yuque-export": "bin/yuque-export.js"
+  },
+  "engines": {
+    "node": ">=18.4"
+  },
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "dependencies": {
+    "yuque-dl": "^1.0.86"
+  }
+}
