@@ -9,7 +9,7 @@ import path from 'node:path'
  * - 清理删除后产生的空目录
  * @param {string} bookRaw 知识库的 raw 目录
  * @param {Set<string>} tocUuids 服务端 TOC 的 uuid 集合
- * @returns {Promise<string[]>} 被移除文档的标题列表
+ * @returns {Promise<string[]>} 被移除文档（DOC 类型）的标题列表
  */
 export async function syncDeletions(bookRaw, tocUuids) {
   const progressPath = path.join(bookRaw, 'progress.json')
@@ -65,34 +65,36 @@ export async function syncDeletions(bookRaw, tocUuids) {
 
   await removeEmptyDirs(bookRaw)
 
-  return removed.map((i) => i?.toc?.title || i?.path || '').filter(Boolean)
+  // 仅报告文档类型（分组目录的删除不单独列出）
+  return removed
+    .filter((i) => String(i?.toc?.type || '').toUpperCase() === 'DOC')
+    .map((i) => i?.toc?.title || i?.path || '')
+    .filter(Boolean)
 }
 
 /**
  * 修复增量状态：progress.json 中记录为已下载、但磁盘上已不存在的文档
  * （如被杀毒软件隔离、缓存文件被误删）→ 移除其条目，使 yuque-dl 本次重新下载。
- * @returns {Promise<number>} 移除的条目数
+ * @returns {Promise<Set<string>>} 被移除条目的 uuid 集合（供同步日志归为“修复”）
  */
 export async function repairMissingRawFiles(bookRaw) {
+  const removedUuids = new Set()
   const progressPath = path.join(bookRaw, 'progress.json')
   try {
     const progress = JSON.parse(await fsp.readFile(progressPath, 'utf-8'))
-    if (!Array.isArray(progress)) return 0
+    if (!Array.isArray(progress)) return removedUuids
     const kept = []
-    let removed = 0
     for (const item of progress) {
       // TITLE 条目的 path 是目录，DOC 条目是 md 文件，均以存在性判断
       if (item?.path && !fs.existsSync(path.join(bookRaw, item.path))) {
-        removed++
+        if (item.toc?.uuid) removedUuids.add(item.toc.uuid)
         continue
       }
       kept.push(item)
     }
-    if (removed > 0) await fsp.writeFile(progressPath, JSON.stringify(kept))
-    return removed
-  } catch {
-    return 0
-  }
+    if (removedUuids.size > 0) await fsp.writeFile(progressPath, JSON.stringify(kept))
+  } catch { /* progress.json 缺失或损坏时无需修复 */ }
+  return removedUuids
 }
 
 /** 递归删除空目录（不删知识库根目录本身） */

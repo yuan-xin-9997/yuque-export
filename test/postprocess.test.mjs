@@ -277,17 +277,18 @@ test('修复：progress 记录已下载但文件缺失时移除条目', async ()
   const { raw, U1 } = await makeFixture()
   await fsp.rm(path.join(raw, `笔记一_${U1}.md`))
   const removed = await repairMissingRawFiles(raw)
-  assert.equal(removed, 1)
+  assert.equal(removed.size, 1)
+  assert.ok(removed.has(U1))
   const progress = JSON.parse(await fsp.readFile(path.join(raw, 'progress.json'), 'utf-8'))
   assert.ok(!progress.some((i) => i.toc.uuid === U1))
   // 存在的文件条目不受影响
   assert.ok(progress.some((i) => i.toc.uuid === 'klmnopqrst0123456'))
 })
 
-test('修复：progress.json 缺失时安全返回 0', async () => {
+test('修复：progress.json 缺失时安全返回空集合', async () => {
   const { raw } = await makeFixture()
   await fsp.rm(path.join(raw, 'progress.json'))
-  assert.equal(await repairMissingRawFiles(raw), 0)
+  assert.equal((await repairMissingRawFiles(raw)).size, 0)
 })
 
 test('导出成功后 raw 不残留空 img/attachments 壳目录', async () => {

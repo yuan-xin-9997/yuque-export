@@ -65,8 +65,8 @@ export async function postprocessBook(bookRaw, bookOut) {
   }
 
   if (errors.length) {
-    console.log(`   ⚠ 「${path.basename(bookRaw)}」有 ${errors.length} 篇笔记处理失败:`)
-    for (const err of errors) console.log(`     ✕ ${err.rawRel}: ${err.msg}`)
+    console.log(`      失败 ${errors.length} 篇（后处理）:`)
+    for (const err of errors) console.log(`        ${err.rawRel}: ${err.msg}`)
   }
 
   // 3. 删除输出目录中已不存在的文件与空目录

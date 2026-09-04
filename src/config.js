@@ -16,7 +16,7 @@ export async function loadConfig() {
 
 export async function saveConfig(config) {
   await fsp.writeFile(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf-8')
-  console.log(`√ 配置已保存: ${CONFIG_PATH}`)
+  console.log(`配置已保存: ${CONFIG_PATH}`)
 }
 
 export function configPath() {
