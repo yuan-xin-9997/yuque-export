@@ -5,7 +5,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import { postprocessBook } from '../src/postprocess.js'
-import { syncDeletions } from '../src/prune.js'
+import { syncDeletions, repairMissingRawFiles } from '../src/prune.js'
 
 /** 构造模拟 yuque-dl 原始输出的夹具 */
 async function makeFixture() {
@@ -271,4 +271,35 @@ test('删除同步：progress.json 缺失时安全返回', async () => {
   assert.deepEqual(removed, [])
   // 文件未被误删
   assert.ok((await fsp.readdir(raw)).length > 0)
+})
+
+test('修复：progress 记录已下载但文件缺失时移除条目', async () => {
+  const { raw, U1 } = await makeFixture()
+  await fsp.rm(path.join(raw, `笔记一_${U1}.md`))
+  const removed = await repairMissingRawFiles(raw)
+  assert.equal(removed, 1)
+  const progress = JSON.parse(await fsp.readFile(path.join(raw, 'progress.json'), 'utf-8'))
+  assert.ok(!progress.some((i) => i.toc.uuid === U1))
+  // 存在的文件条目不受影响
+  assert.ok(progress.some((i) => i.toc.uuid === 'klmnopqrst0123456'))
+})
+
+test('修复：progress.json 缺失时安全返回 0', async () => {
+  const { raw } = await makeFixture()
+  await fsp.rm(path.join(raw, 'progress.json'))
+  assert.equal(await repairMissingRawFiles(raw), 0)
+})
+
+test('导出成功后 raw 不残留空 img/attachments 壳目录', async () => {
+  const { raw, out } = await makeFixture()
+  await postprocessBook(raw, out)
+  const walk = async (d) => {
+    for (const e of await fsp.readdir(d, { withFileTypes: true })) {
+      if (e.isDirectory()) {
+        assert.ok(!['img', 'attachments'].includes(e.name), `不应残留空壳目录: ${e.name}`)
+        await walk(path.join(d, e.name))
+      }
+    }
+  }
+  await walk(raw)
 })

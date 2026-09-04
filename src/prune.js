@@ -1,4 +1,5 @@
 import fsp from 'node:fs/promises'
+import fs from 'node:fs'
 import path from 'node:path'
 
 /**
@@ -65,6 +66,33 @@ export async function syncDeletions(bookRaw, tocUuids) {
   await removeEmptyDirs(bookRaw)
 
   return removed.map((i) => i?.toc?.title || i?.path || '').filter(Boolean)
+}
+
+/**
+ * 修复增量状态：progress.json 中记录为已下载、但磁盘上已不存在的文档
+ * （如被杀毒软件隔离、缓存文件被误删）→ 移除其条目，使 yuque-dl 本次重新下载。
+ * @returns {Promise<number>} 移除的条目数
+ */
+export async function repairMissingRawFiles(bookRaw) {
+  const progressPath = path.join(bookRaw, 'progress.json')
+  try {
+    const progress = JSON.parse(await fsp.readFile(progressPath, 'utf-8'))
+    if (!Array.isArray(progress)) return 0
+    const kept = []
+    let removed = 0
+    for (const item of progress) {
+      // TITLE 条目的 path 是目录，DOC 条目是 md 文件，均以存在性判断
+      if (item?.path && !fs.existsSync(path.join(bookRaw, item.path))) {
+        removed++
+        continue
+      }
+      kept.push(item)
+    }
+    if (removed > 0) await fsp.writeFile(progressPath, JSON.stringify(kept))
+    return removed
+  } catch {
+    return 0
+  }
 }
 
 /** 递归删除空目录（不删知识库根目录本身） */

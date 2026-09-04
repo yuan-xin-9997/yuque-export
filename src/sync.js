@@ -5,7 +5,7 @@ import fsp from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { getUserBooks, filterBooks, getBookTocUuids } from './api.js'
 import { postprocessBook } from './postprocess.js'
-import { syncDeletions } from './prune.js'
+import { syncDeletions, repairMissingRawFiles } from './prune.js'
 import { sanitize } from './util.js'
 
 const require = createRequire(import.meta.url)
@@ -24,19 +24,131 @@ function resolveYuqueDlBin() {
   throw new Error('未找到 yuque-dl，请先在项目目录执行 npm install')
 }
 
-/** 运行 yuque-dl（透传 stdio，实时展示进度） */
-function runYuqueDl(args) {
+/** 字节数格式化 */
+function fmtBytes(n) {
+  if (!Number.isFinite(n) || n <= 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  let v = n
+  let i = 0
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++ }
+  return `${v >= 100 ? v.toFixed(0) : v.toFixed(1)} ${units[i]}`
+}
+
+/** 终端中可被 \r 覆盖刷新的单行状态 */
+class LiveLine {
+  constructor() {
+    this.text = ''
+    this.active = false
+  }
+  set(text) {
+    this.text = text
+    this.active = true
+    process.stdout.write(`\r\x1b[2K${text}`)
+  }
+  clear() {
+    if (this.active) process.stdout.write('\r\x1b[2K')
+    this.active = false
+  }
+}
+
+/**
+ * 下载量监控：周期扫描 raw 目录，按 mtime 统计本次运行实际写入的数据量
+ * （yuque-dl 不提供字节级进度，这里以磁盘落盘量为准）。
+ */
+class ByteMeter {
+  constructor(dir, sinceMs) {
+    this.dir = dir
+    this.since = sinceMs
+    this.bytes = 0
+    this.docs = 0
+    this.speed = 0
+    this._prev = { bytes: 0, time: Date.now() }
+    this._timer = null
+    this.onSample = null
+  }
+  start() {
+    this._timer = setInterval(() => this.sample().catch(() => {}), 800)
+  }
+  stop() {
+    if (this._timer) clearInterval(this._timer)
+    this._timer = null
+  }
+  async sample() {
+    let bytes = 0
+    let docs = 0
+    const walk = async (d) => {
+      let entries
+      try { entries = await fsp.readdir(d, { withFileTypes: true }) } catch { return }
+      for (const e of entries) {
+        const abs = path.join(d, e.name)
+        if (e.isDirectory()) {
+          await walk(abs)
+          continue
+        }
+        // 排除每次运行都会重写的状态文件，只统计真实下载数据
+        if (e.name === 'progress.json' || e.name === 'index.md' || e.name.startsWith('.')) continue
+        const st = await fsp.stat(abs).catch(() => null)
+        if (!st || st.mtimeMs < this.since) continue
+        bytes += st.size
+        if (e.name.endsWith('.md')) docs++
+      }
+    }
+    await walk(this.dir)
+    const now = Date.now()
+    const dt = (now - this._prev.time) / 1000
+    if (dt > 0.2) {
+      const inst = Math.max(0, (bytes - this._prev.bytes) / dt)
+      this.speed = this.speed ? this.speed * 0.6 + inst * 0.4 : inst
+      this._prev = { bytes, time: now }
+    }
+    this.bytes = bytes
+    this.docs = docs
+    if (this.onSample) this.onSample()
+  }
+}
+
+/**
+ * 运行 yuque-dl 下载单个知识库：
+ * 抑制其逐篇 "Download [===]" 进度条，其余日志（INFO/ERROR）原样透传。
+ */
+function runYuqueDlBook(url, extraArgs, { onLine }) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [resolveYuqueDlBin(), ...args], { stdio: 'inherit' })
+    const child = spawn(process.execPath, [resolveYuqueDlBin(), url, ...extraArgs], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let buf = ''
+    const handle = (chunk) => {
+      buf += chunk.toString()
+      const parts = buf.split(/\r|\n/)
+      buf = parts.pop() // 末段可能不完整，留待下个 chunk
+      for (const line of parts) {
+        if (!line.trim()) continue
+        if (/^Download \[/.test(line)) continue // 逐篇检查/下载共用同一条进度条，无法区分，统一抑制
+        onLine(line)
+      }
+    }
+    child.stdout.on('data', handle)
+    child.stderr.on('data', handle)
     child.on('error', reject)
     child.on('exit', (code) => {
+      if (buf.trim() && !/^Download \[/.test(buf)) onLine(buf)
       if (code === 0) resolve()
       else reject(new Error(`yuque-dl 退出码 ${code}`))
     })
   })
 }
 
-/** 主流程：枚举 → 过滤 → 下载 → 后处理 */
+/** 在 raw 中定位知识库目录（yuque-dl 目录名做了非法字符替换） */
+async function findBookRaw(rawDir, b) {
+  const direct = path.join(rawDir, sanitize(b.name))
+  if (fs.existsSync(direct)) return direct
+  const norm = (s) => s.replace(/[\\/:*?"<>|\n\r]/g, '_')
+  const names = await fsp.readdir(rawDir).catch(() => [])
+  const found = names.find((n) => norm(n) === norm(b.name))
+  return found ? path.join(rawDir, found) : null
+}
+
+/** 主流程：枚举 → 过滤 → 逐库（修复缺失 → 下载 → 删除同步 → 后处理） */
 export async function sync(config) {
   const distDir = path.resolve(config.distDir)
   const rawDir = path.join(distDir, RAW_DIR_NAME)
@@ -53,69 +165,96 @@ export async function sync(config) {
   books.forEach((b) => console.log(`   - ${b.name}（${b.itemsCount} 篇）`))
   console.log('')
 
-  const yuqueDlArgs = [
-    'batch',
-    ...books.map((b) => `https://www.yuque.com/${b.userLogin}/${b.slug}`),
-    '-t', config.token,
-    '-d', rawDir,
-    '--incremental',
-  ]
-  if (config.key) yuqueDlArgs.push('-k', config.key)
-  if (config.toc) yuqueDlArgs.push('--toc')
-  if (config.hideFooter) yuqueDlArgs.push('--hideFooter')
-  if (config.ignoreAttachments === true) {
-    yuqueDlArgs.push('--ignoreAttachments')
-  } else if (typeof config.ignoreAttachments === 'string') {
-    yuqueDlArgs.push('--ignoreAttachments', config.ignoreAttachments)
-  }
-
-  console.log('▶ 开始下载（增量模式，首次会比较慢）...\n')
-  await runYuqueDl(yuqueDlArgs)
-
   // 知识库级删除同步：raw 中存在但账号已不存在的知识库 → 移除 raw 与输出
   await pruneDeletedBooks(distDir, rawDir, allBooks)
 
-  console.log('\n▶ 删除同步与后处理：清理已删文档、清理命名、重组资源到 .assets 目录...')
+  const commonArgs = ['-t', config.token, '-d', rawDir, '--incremental']
+  if (config.key) commonArgs.push('-k', config.key)
+  if (config.toc) commonArgs.push('--toc')
+  if (config.hideFooter) commonArgs.push('--hideFooter')
+  if (config.ignoreAttachments === true) {
+    commonArgs.push('--ignoreAttachments')
+  } else if (typeof config.ignoreAttachments === 'string') {
+    commonArgs.push('--ignoreAttachments', config.ignoreAttachments)
+  }
+
+  const startTime = Date.now()
   let totalNotes = 0
-  for (const b of books) {
-    const bookRaw = path.join(rawDir, b.name)
-    const bookOut = path.join(distDir, sanitize(b.name))
-    if (!fs.existsSync(bookRaw)) {
-      // yuque-dl 目录名带非法字符替换，兜底找一下
-      const found = await fsp.readdir(rawDir).then((names) =>
-        names.find((n) => n.replace(/[\\/:*?"<>|]/g, '_') === b.name.replace(/[\\/:*?"<>|]/g, '_')),
-      )
-      if (!found) {
-        console.log(`   ✕ 跳过「${b.name}」：未找到下载结果`)
-        continue
+  let totalBytes = 0
+
+  for (let i = 0; i < books.length; i++) {
+    const b = books[i]
+    const url = `https://www.yuque.com/${b.userLogin}/${b.slug}`
+    const label = `[${i + 1}/${books.length}] ${b.name}`
+    const bookRaw = path.join(rawDir, sanitize(b.name))
+
+    // 修复：progress 记录已下载但文件缺失（如被杀毒软件隔离）→ 移除条目，本次重新下载
+    const repaired = await repairMissingRawFiles(bookRaw)
+    if (repaired > 0) {
+      console.log(`▶ ${label}`)
+      console.log(`   - 检测到 ${repaired} 篇本地文件缺失（可能被杀毒软件隔离），将重新下载`)
+    }
+
+    const meter = new ByteMeter(bookRaw, startTime)
+    const live = new LiveLine()
+    meter.onSample = () => {
+      if (meter.bytes <= 0) return
+      const parts = [`   ↓ ${label} 已下载 ${fmtBytes(meter.bytes)}`, `${fmtBytes(meter.speed)}/s`]
+      if (meter.docs > 0) parts.push(`${meter.docs} 篇更新`)
+      live.set(parts.join(' · '))
+    }
+    meter.start()
+    let downloadOk = true
+    try {
+      await runYuqueDlBook(url, commonArgs, {
+        onLine(line) {
+          live.clear()
+          process.stdout.write(`${line}\n`)
+        },
+      })
+    } catch (e) {
+      downloadOk = false
+      console.log(`   ✕ ${label} 下载失败: ${e.message}`)
+    } finally {
+      meter.stop()
+      await meter.sample().catch(() => {})
+      live.clear()
+    }
+    if (downloadOk) {
+      if (meter.bytes > 0) {
+        console.log(`   √ ${label}: 下载 ${fmtBytes(meter.bytes)}${meter.docs > 0 ? `，${meter.docs} 篇更新` : ''}`)
+      } else {
+        console.log(`   √ ${label}: 无更新`)
       }
-      const res = await postprocessBook(path.join(rawDir, found), path.join(distDir, sanitize(found)))
-      totalNotes += res
+    }
+    totalBytes += meter.bytes
+
+    // 下载后：文档级删除同步 + 后处理
+    const bookRawFound = await findBookRaw(rawDir, b)
+    if (!bookRawFound) {
+      console.log(`   ✕ ${label}: 未找到下载结果，跳过后处理`)
       continue
     }
     try {
-      // 文档级删除同步：以服务端 TOC 为准清理已删除文档
       try {
-        const tocUuids = await getBookTocUuids(`https://www.yuque.com/${b.userLogin}/${b.slug}`, {
-          token: config.token,
-          key: config.key,
-        })
-        const removed = await syncDeletions(bookRaw, tocUuids)
+        const tocUuids = await getBookTocUuids(url, { token: config.token, key: config.key })
+        const removed = await syncDeletions(bookRawFound, tocUuids)
         if (removed.length) {
-          console.log(`   - 「${b.name}」已删除 ${removed.length} 篇: ${removed.join('、')}`)
+          console.log(`   - ${label}: 已删除 ${removed.length} 篇: ${removed.join('、')}`)
         }
       } catch (e) {
         // TOC 获取失败时保守跳过删除同步，绝不误删
-        console.log(`   ⚠ 「${b.name}」目录树获取失败，跳过删除同步: ${e.message}`)
+        console.log(`   ⚠ ${label}: 目录树获取失败，跳过删除同步: ${e.message}`)
       }
-      const res = await postprocessBook(bookRaw, bookOut)
+      const res = await postprocessBook(bookRawFound, path.join(distDir, path.basename(bookRawFound)))
       totalNotes += res
     } catch (e) {
-      console.log(`   ✕ 「${b.name}」后处理失败: ${e.message}`)
+      console.log(`   ✕ ${label}: 后处理失败: ${e.message}`)
     }
   }
 
-  console.log(`\n√ 同步完成：${books.length} 个知识库，共处理 ${totalNotes} 篇笔记`)
+  console.log(`\n√ 同步完成：${books.length} 个知识库，共处理 ${totalNotes} 篇笔记` +
+    (totalBytes > 0 ? `，本次下载 ${fmtBytes(totalBytes)}` : ''))
   console.log(`  导出目录: ${distDir}`)
   console.log(`  增量缓存: ${rawDir}（请勿删除或修改，否则增量失效）`)
 }

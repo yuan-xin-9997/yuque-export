@@ -114,12 +114,16 @@ function assetsNameFor(cleanRel) {
     : `${base.replace(/\.md$/, '')}.assets`
 }
 
-/** 删除 raw 中该笔记的资源副本（img/<uuid>、attachments/<uuid>） */
+/** 删除 raw 中该笔记的资源副本（img/<uuid>、attachments/<uuid>），顺带清理空壳目录 */
 async function pruneRawAssets(bookRaw, rawRel, uuid) {
   if (!uuid) return
   const dir = path.posix.dirname(rawRel)
   for (const kind of ['img', 'attachments']) {
-    await fsp.rm(path.join(bookRaw, dir, kind, uuid), { recursive: true, force: true })
+    const kindDir = path.join(bookRaw, dir, kind)
+    await fsp.rm(path.join(kindDir, uuid), { recursive: true, force: true })
+    // 资源副本清完后，若 kind 目录已空则一并删除
+    const left = await fsp.readdir(kindDir).catch(() => null)
+    if (left !== null && left.length === 0) await fsp.rmdir(kindDir).catch(() => {})
   }
 }
 
