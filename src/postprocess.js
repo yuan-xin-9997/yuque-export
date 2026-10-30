@@ -70,7 +70,7 @@ export async function postprocessBook(bookRaw, bookOut, options = {}) {
     try {
       // 未变化的笔记（输出 mtime 与 raw 一致）直接跳过，避免重复处理
       if (!fullScan && owned[cleanRel] && await isNoteUnchanged(rawAbs, outAbs) &&
-          await digest(outAbs) === owned[cleanRel] && await assetsPresent(bookOut, owned, cleanRel)) {
+          await digest(outAbs) === owned[cleanRel] && state.rawFiles?.[rawRel] === await digest(rawAbs) && await assetsPresent(bookOut, owned, cleanRel)) {
         keepSet.add(cleanRel)
         await keepExistingAssets(bookOut, cleanRel, keepSet, owned)
         noteCount++

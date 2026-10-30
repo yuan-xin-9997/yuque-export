@@ -310,3 +310,14 @@ test('导出成功后 raw 不残留空 img/attachments 壳目录', async () => {
   }
   await walk(raw)
 })
+
+test('后处理：源内容改变但 mtime 相同仍处理新内容', async () => {
+  const { raw, out, U1 } = await makeFixture()
+  await postprocessBook(raw, out)
+  const source = path.join(raw, `笔记一_${U1}.md`)
+  const old = await fsp.stat(source)
+  await fsp.writeFile(source, '# 新正文\n')
+  await fsp.utimes(source, old.atime, old.mtime)
+  await postprocessBook(raw, out)
+  assert.equal(await fsp.readFile(path.join(out, '笔记一.md'), 'utf8'), '# 新正文\n')
+})
