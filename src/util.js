@@ -18,42 +18,35 @@ export function stripUuidSuffix(name) {
 
 /** 终端交互提问 */
 export async function ask(question, { secret = false } = {}) {
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
-  let answer
-  if (secret) {
-    // 关闭回显输入 token
-    const stdout = process.stdout
-    answer = await new Promise((resolve) => {
-      const stdin = process.stdin
-      stdin.setRawMode?.(true)
-      stdin.resume()
+  if (!secret) {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
+    try { return (await rl.question(question)).trim() } finally { rl.close() }
+  }
+  if (!process.stdin.isTTY) throw new Error('登录凭据需要交互终端输入；请使用用户配置文件')
+  process.stdout.write(question)
+  const stdin = process.stdin
+  const wasRaw = stdin.isRaw
+  stdin.setRawMode(true)
+  stdin.resume()
+  try {
+    return await new Promise((resolve, reject) => {
       let buf = ''
-      const onData = (ch) => {
-        ch = String(ch)
-        // Ctrl+C
-        if (ch === '') {
-          stdin.removeListener('data', onData)
-          rl.close()
-          process.exit(1)
-        }
-        if (ch === '\r' || ch === '\n') {
-          stdin.removeListener('data', onData)
-          stdin.setRawMode?.(false)
-          stdout.write('\n')
-          resolve(buf)
-        } else if (ch === '' || ch === '\b') {
-          if (buf.length) buf = buf.slice(0, -1)
-        } else {
-          buf += ch
+      const finish = (error) => {
+        stdin.removeListener('data', onData)
+        process.stdout.write('\n')
+        error ? reject(error) : resolve(buf.trim())
+      }
+      const onData = chunk => {
+        for (const ch of String(chunk)) {
+          if (ch === '\u0003') { finish(new Error('已取消输入')); return }
+          if (ch === '\r' || ch === '\n') { finish(); return }
+          if (ch === '\u007f' || ch === '\b') buf = buf.slice(0, -1)
+          else buf += ch
         }
       }
       stdin.on('data', onData)
     })
-  } else {
-    answer = await rl.question(question)
-  }
-  rl.close()
-  return answer.trim()
+  } finally { stdin.setRawMode(wasRaw); stdin.pause() }
 }
 
 export function exists(p) {

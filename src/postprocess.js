@@ -2,6 +2,8 @@ import fsp from 'node:fs/promises'
 import fs from 'node:fs'
 import path from 'node:path'
 import { sanitize, readdirSorted, toMdLink } from './util.js'
+import { redact } from './secrets.js'
+import { safePath, assertTree, atomicJson, readJson, digest, cleanOwned } from './safety.js'
 
 /**
  * 后处理单个知识库：把 yuque-dl 的原始输出（`标题_<uuid>.md` 命名、
@@ -18,9 +20,12 @@ import { sanitize, readdirSorted, toMdLink } from './util.js'
  */
 
 /** 后处理逻辑版本：逻辑变更时提升，触发一次全量重扫描 */
-const LOGIC_VERSION = 2
+const LOGIC_VERSION = 3
 
-export async function postprocessBook(bookRaw, bookOut) {
+export async function postprocessBook(bookRaw, bookOut, options = {}) {
+  const { mode = 'retain', confirmed = false, preview = false } = options
+  await assertTree(bookRaw)
+  await assertTree(bookOut)
   if (!fs.existsSync(bookRaw)) return 0
 
   // 1. 建立 raw 相对路径 -> clean 相对路径 映射（仅 md 文件与目录）
@@ -31,33 +36,51 @@ export async function postprocessBook(bookRaw, bookOut) {
 
   // 状态文件记录后处理逻辑版本；版本变化时全量重扫（防止旧逻辑输出被跳过）
   const stateFile = path.join(bookRaw, '.export-state.json')
-  let stateVersion = null
-  try {
-    stateVersion = JSON.parse(await fsp.readFile(stateFile, 'utf-8')).version
-  } catch { /* 首次运行 */ }
-  const fullScan = stateVersion !== LOGIC_VERSION
+  const state = await readJson(stateFile, {})
+  if (state.output && state.output !== path.resolve(bookOut)) throw new Error('输出目录归属不匹配；保留已有数据')
+  const owned = state.files || {}
+  const fullScan = state.version !== LOGIC_VERSION
+  if (!state.files) console.log('      首次建立文件归属清单；未登记的旧文件保留')
+  if (preview) {
+    const planned = new Set(['index.md'])
+    for (const [uuid, rel] of Object.entries(state.notePaths || {})) {
+      if (options.tocUuids && !options.tocUuids.has(uuid)) continue
+      planned.add(rel)
+      const name = assetsNameFor(rel)
+      const prefix = path.posix.join(path.posix.dirname(rel), name || '') + '/'
+      for (const asset of Object.keys(owned)) if (asset.startsWith(prefix)) planned.add(asset)
+    }
+    if (confirmed) await cleanOwned(bookOut, owned, planned, options)
+    return fileMap.size
+  }
 
   // 2. 逐个 md 处理，收集输出的全部文件（含资源），keepSet 用于镜像清理
   const keepSet = new Set()
   const errors = []
   let noteCount = 0
+  const copiedRaw = new Map()
+  const produced = new Set()
+  const notePaths = {}
 
   for (const [rawRel, cleanRel] of fileMap) {
     const rawAbs = path.join(bookRaw, rawRel)
-    const outAbs = path.join(bookOut, cleanRel)
+    const outAbs = await safePath(bookOut, cleanRel)
+    const uuid = uuidByPath.get(rawRel)
+    if (uuid) notePaths[uuid] = cleanRel
     try {
       // 未变化的笔记（输出 mtime 与 raw 一致）直接跳过，避免重复处理
-      if (!fullScan && (await isNoteUnchanged(rawAbs, outAbs))) {
+      if (!fullScan && owned[cleanRel] && await isNoteUnchanged(rawAbs, outAbs) &&
+          await digest(outAbs) === owned[cleanRel] && await assetsPresent(bookOut, owned, cleanRel)) {
         keepSet.add(cleanRel)
-        await keepExistingAssets(bookOut, cleanRel, keepSet)
+        await keepExistingAssets(bookOut, cleanRel, keepSet, owned)
         noteCount++
         continue
       }
       const prevContent = await readFileOrNull(outAbs)
-      await processNote({ bookRaw, bookOut, rawRel, cleanRel, fileMap, keepSet, prevContent })
+      await processNote({ bookRaw, bookOut, rawRel, cleanRel, fileMap, keepSet, prevContent, owned, copiedRaw, produced, previousRel: state.notePaths?.[uuid] })
       noteCount++
       // 导出成功：删除 raw 中该笔记的资源副本（输出目录已是完整拷贝）
-      await pruneRawAssets(bookRaw, rawRel, uuidByPath.get(rawRel))
+      // Raw copies are collected only after a verified successful copy.
     } catch (e) {
       // 单篇失败（如被杀毒软件隔离、文件损坏）不中断整个知识库的处理
       errors.push({ rawRel, msg: e.message })
@@ -66,15 +89,24 @@ export async function postprocessBook(bookRaw, bookOut) {
 
   if (errors.length) {
     console.log(`      失败 ${errors.length} 篇（后处理）:`)
-    for (const err of errors) console.log(`        ${err.rawRel}: ${err.msg}`)
+    for (const err of errors) console.log(redact(`        ${err.rawRel}: ${err.msg}`))
   }
 
-  // 3. 删除输出目录中已不存在的文件与空目录
-  await pruneStale(bookOut, keepSet)
-
-  try {
-    await fsp.writeFile(stateFile, JSON.stringify({ version: LOGIC_VERSION }))
-  } catch { /* 只读 raw 目录时忽略 */ }
+  // Any processing failure blocks cleanup and preserves the last good ledger.
+  let files = { ...owned }
+  if (confirmed && !errors.length) files = await cleanOwned(bookOut, owned, keepSet, options)
+  for (const rel of keepSet) {
+    const target = await safePath(bookOut, rel)
+    const hash = await digest(target)
+    if (!owned[rel] || produced.has(rel) || hash === owned[rel]) files[rel] = hash
+  }
+  const rawFiles = {}
+  for (const rel of fileMap.keys()) {
+    if (uuidByPath.has(rel) || rel === 'index.md') rawFiles[rel] = await digest(await safePath(bookRaw, rel))
+  }
+  await atomicJson(stateFile, { ...state, version: LOGIC_VERSION, output: path.resolve(bookOut), files, rawFiles, notePaths, cleanupScope: options.cleanupScope ?? state.cleanupScope })
+  // The durable ledger is saved before reclaiming verified raw copies.
+  if (!errors.length) await cleanOwned(bookRaw, Object.fromEntries(copiedRaw), new Set(), { mode: 'mirror', report: () => {} })
 
   return noteCount
 }
@@ -90,7 +122,7 @@ async function isNoteUnchanged(rawAbs, outAbs) {
 }
 
 /** 跳过未变化笔记时，把输出中既有的资源文件登记进 keepSet（防被 pruneStale 清理） */
-async function keepExistingAssets(bookOut, cleanRel, keepSet) {
+async function keepExistingAssets(bookOut, cleanRel, keepSet, owned) {
   const name = assetsNameFor(cleanRel)
   if (!name) return
   const dir = path.join(bookOut, path.posix.dirname(cleanRel), name)
@@ -99,7 +131,10 @@ async function keepExistingAssets(bookOut, cleanRel, keepSet) {
     for (const e of await readdirSorted(d)) {
       const abs = path.join(d, e.name)
       if (e.isDirectory()) await walk(abs)
-      else keepSet.add(path.relative(bookOut, abs).split(path.sep).join('/'))
+      else {
+        const rel = path.relative(bookOut, abs).split(path.sep).join('/')
+        if (owned[rel]) keepSet.add(rel)
+      }
     }
   })(dir)
 }
@@ -114,17 +149,14 @@ function assetsNameFor(cleanRel) {
     : `${base.replace(/\.md$/, '')}.assets`
 }
 
-/** 删除 raw 中该笔记的资源副本（img/<uuid>、attachments/<uuid>），顺带清理空壳目录 */
-async function pruneRawAssets(bookRaw, rawRel, uuid) {
-  if (!uuid) return
-  const dir = path.posix.dirname(rawRel)
-  for (const kind of ['img', 'attachments']) {
-    const kindDir = path.join(bookRaw, dir, kind)
-    await fsp.rm(path.join(kindDir, uuid), { recursive: true, force: true })
-    // 资源副本清完后，若 kind 目录已空则一并删除
-    const left = await fsp.readdir(kindDir).catch(() => null)
-    if (left !== null && left.length === 0) await fsp.rmdir(kindDir).catch(() => {})
+async function assetsPresent(bookOut, owned, cleanRel) {
+  const name = assetsNameFor(cleanRel)
+  if (!name) return true
+  const prefix = path.posix.join(path.posix.dirname(cleanRel), name) + '/'
+  for (const rel of Object.keys(owned)) {
+    if (rel.startsWith(prefix) && !fs.existsSync(await safePath(bookOut, rel))) return false
   }
+  return true
 }
 
 async function readFileOrNull(p) {
@@ -136,7 +168,7 @@ async function readFileOrNull(p) {
 }
 
 /** 处理单篇笔记（被 postprocessBook 调用，错误向上抛由其汇总） */
-async function processNote({ bookRaw, bookOut, rawRel, cleanRel, fileMap, keepSet, prevContent }) {
+async function processNote({ bookRaw, bookOut, rawRel, cleanRel, fileMap, keepSet, prevContent, owned, copiedRaw, produced, previousRel }) {
   const rawAbs = path.join(bookRaw, rawRel)
   let content = await fsp.readFile(rawAbs, 'utf-8')
 
@@ -151,7 +183,7 @@ async function processNote({ bookRaw, bookOut, rawRel, cleanRel, fileMap, keepSe
       cleanRel,
       assetsName,
       keepSet,
-      prevContent,
+      prevContent, owned, copiedRaw, produced, previousRel,
     })
   }
 
@@ -160,8 +192,10 @@ async function processNote({ bookRaw, bookOut, rawRel, cleanRel, fileMap, keepSe
 
   const outAbs = path.join(bookOut, cleanRel)
   await fsp.mkdir(path.dirname(outAbs), { recursive: true })
+  await assertWritable(bookOut, cleanRel, owned, Buffer.from(content))
   await writeIfChanged(outAbs, content, rawAbs)
   keepSet.add(cleanRel)
+  produced.add(cleanRel)
 }
 
 /** 从 progress.json 读取全部 toc uuid（用于精确剥离文件名后缀） */
@@ -216,7 +250,7 @@ async function buildMaps(bookRaw, rawDir, cleanDir, fileMap, uuids) {
 
   const planned = []
   for (const e of entries) {
-    if (e.name === 'progress.json') continue
+    if (e.name === 'progress.json' || e.name.startsWith('.')) continue
     if (e.isDirectory() && (e.name === 'img' || e.name === 'attachments')) continue // 资源缓存，按需取用
     const clean = dedupe(sanitize(stripUuid(e.name, uuids, e.isFile())), used)
     used.add(clean.toLowerCase())
@@ -251,94 +285,50 @@ function dedupe(name, used) {
  * 安全网：若 raw 中的资源已被清理（笔记未变化或历史版本处理过），
  * 沿用输出目录中仍存在的既有引用，避免链接失效。
  */
-async function relocateAssets(content, { bookRaw, bookOut, rawRel, cleanRel, assetsName, keepSet, prevContent }) {
+async function relocateAssets(content, { bookRaw, bookOut, rawRel, cleanRel, assetsName, keepSet, owned, copiedRaw, produced, previousRel }) {
   const rawMdDir = path.posix.dirname(rawRel)
   const cleanMdDir = path.posix.dirname(cleanRel)
-  const outAssetsRel = cleanMdDir === '.' ? assetsName : `${cleanMdDir}/${assetsName}`
-  const usedAssetNames = new Map() // 原始文件名 -> 输出文件名（目录内去重）
-
-  /** 处理单个引用路径，返回改写后的引用（无需改写时返回 null） */
-  const handleRef = async (ref) => {
-    try {
-      const m = ref.match(/^\.?\/?(img|attachments)\/(.+)$/)
-      if (!m) return null
-    // yuque-dl 在 Windows 上生成的视频引用含反斜杠分隔，统一为正斜杠
-    const assetPath = m[2].replace(/\\/g, '/')
-    const rawAssetRel = `${rawMdDir === '.' ? '' : rawMdDir + '/'}${m[1]}/${assetPath}`
-    let rawAssetAbs
-    try {
-      rawAssetAbs = path.join(bookRaw, decodeURIComponent(rawAssetRel))
-    } catch {
-      return null
-    }
-    if (!fs.existsSync(rawAssetAbs)) return null
-    if (!(await fsp.stat(rawAssetAbs)).isFile()) return null
-
-    const origName = path.posix.basename(decodeURIComponent(assetPath))
-    let outName = usedAssetNames.get(origName)
-    if (!outName) {
-      const taken = new Set([...usedAssetNames.values()].map((s) => s.toLowerCase()))
-      outName = origName
-      let i = 2
-      const dot = origName.lastIndexOf('.')
-      while (taken.has(outName.toLowerCase())) {
-        outName = dot > 0 ? `${origName.slice(0, dot)}-${i}${origName.slice(dot)}` : `${origName}-${i}`
-        i++
-      }
-      usedAssetNames.set(origName, outName)
-    }
-
-    const outRel = `${outAssetsRel}/${outName}`
-    const outAbs = path.join(bookOut, outRel)
-    await fsp.mkdir(path.dirname(outAbs), { recursive: true })
-    await copyIfChanged(rawAssetAbs, outAbs)
-    keepSet.add(outRel)
-
-    // 新引用 = 笔记位置到资源的相对路径
-    const rel = path.posix.relative(cleanMdDir, outRel)
-    return toMdLink(rel)
-    } catch {
-      return null
-    }
-  }
-
-  // markdown 链接/图片语法（图片 ![]() 与附件 []()）
+  const outAssetsRel = path.posix.join(cleanMdDir, assetsName)
+  const names = new Map()
   const refs = []
   content = content.replace(/(!?\[[^\]]*\]\(\s*)([^)\s]+)([^)]*\))/g, (full, pre, ref, post) => {
     refs.push(ref)
-    return `${pre}\x00${refs.length - 1}\x00${post}`
+    return pre + '\x00' + (refs.length - 1) + '\x00' + post
   })
-  const rewritten = await Promise.all(refs.map(handleRef))
-
-  // 上次输出的引用（与本次提取顺序一致），raw 资源缺失时回退沿用
-  const prevRefs = []
-  if (prevContent) {
-    prevContent.replace(/(!?\[[^\]]*\]\(\s*)([^)\s]+)([^)]*\))/g, (full, pre, ref) => {
-      prevRefs.push(ref)
-      return full
-    })
-  }
-
-  content = content.replace(/\x00(\d+)\x00/g, (full, idx) => {
-    const i = Number(idx)
-    if (rewritten[i] !== null) return rewritten[i]
-    const prev = prevRefs[i]
-    if (prev) {
-      try {
-        const target = path.resolve(
-          bookOut,
-          path.posix.dirname(cleanRel),
-          decodeURIComponent(prev.replace(/^\.\//, '')),
-        )
-        if (fs.existsSync(target)) {
-          keepSet.add(path.relative(bookOut, target).split(path.sep).join('/'))
-          return prev
-        }
-      } catch { /* 引用解码失败则放弃回退 */ }
+  const rewritten = []
+  for (const ref of refs) {
+    const match = ref.match(/^\.?\/?(img|attachments)\/(.+)$/)
+    if (!match) { rewritten.push(ref); continue }
+    const assetPath = decodeURIComponent(match[2].replace(/\\/g, '/'))
+    const rawAssetAbs = await safePath(bookRaw, path.posix.join(rawMdDir, match[1]) + '/' + assetPath)
+    let outName = names.get(assetPath)
+    if (!outName) {
+      const orig = path.posix.basename(assetPath)
+      outName = orig
+      let i = 2
+      const ext = path.posix.extname(orig)
+      while ([...names.values()].some(n => n.toLowerCase() === outName.toLowerCase())) {
+        outName = orig.slice(0, orig.length - ext.length) + '-' + i++ + ext
+      }
+      names.set(assetPath, outName)
     }
-    return refs[i]
-  })
-  return content
+    const outRel = path.posix.join(outAssetsRel, outName)
+    const outAbs = await safePath(bookOut, outRel)
+    let source = rawAssetAbs
+    if (!fs.existsSync(source)) {
+      const prior = previousRel || cleanRel
+      source = await safePath(bookOut, path.posix.join(path.posix.dirname(prior), assetsNameFor(prior), outName))
+      if (!fs.existsSync(source)) throw new Error('资源缺失；保留已有输出，等待重新下载')
+    }
+    await assertWritable(bookOut, outRel, owned, await fsp.readFile(source))
+    await fsp.mkdir(path.dirname(outAbs), { recursive: true })
+    if (source !== outAbs) await copyIfChanged(source, outAbs)
+    if (source === rawAssetAbs) copiedRaw.set(path.relative(bookRaw, source).split(path.sep).join('/'), await digest(outAbs))
+    keepSet.add(outRel)
+    produced.add(outRel)
+    rewritten.push(toMdLink(path.posix.relative(cleanMdDir, outRel)))
+  }
+  return content.replace(/\x00(\d+)\x00/g, (full, idx) => rewritten[Number(idx)])
 }
 
 /** index.md 中指向其他笔记的链接改写（uuid 命名 -> 干净命名）；指向已删除文档的死链降级为纯文本 */
@@ -381,21 +371,12 @@ async function writeIfChanged(dstAbs, content, srcAbs) {
   await fsp.utimes(dstAbs, srcStat.atime, srcStat.mtime)
 }
 
-/** 删除输出目录中不在 keepSet 里的文件与空目录 */
-async function pruneStale(bookOut, keepSet) {
-  if (!fs.existsSync(bookOut)) return
-  await (async function walk(dir) {
-    for (const e of await readdirSorted(dir)) {
-      const abs = path.join(dir, e.name)
-      if (e.isDirectory()) {
-        await walk(abs)
-        // 目录内已无文件则删除
-        const left = await fsp.readdir(abs)
-        if (left.length === 0) await fsp.rmdir(abs)
-      } else {
-        const rel = path.relative(bookOut, abs).split(path.sep).join('/')
-        if (!keepSet.has(rel)) await fsp.rm(abs, { force: true })
-      }
-    }
-  })(bookOut)
+async function assertWritable(root, rel, owned, bytes) {
+  const target = await safePath(root, rel)
+  if (!fs.existsSync(target)) return
+  const current = await fsp.readFile(target)
+  if (current.equals(bytes)) return
+  if (!owned[rel] || await digest(target) !== owned[rel]) {
+    throw new Error('目标为未登记文件或本地修改；请先移走冲突文件')
+  }
 }

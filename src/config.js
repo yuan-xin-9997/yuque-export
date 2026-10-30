@@ -2,21 +2,25 @@ import fsp from 'node:fs/promises'
 import path from 'node:path'
 import os from 'node:os'
 import { ask } from './util.js'
+import { atomicJson, readJson, syncMode } from './safety.js'
+import { rememberSecret } from './secrets.js'
 
 const CONFIG_PATH = path.join(os.homedir(), '.yuque-export.json')
 
-export async function loadConfig() {
-  try {
-    const str = await fsp.readFile(CONFIG_PATH, 'utf-8')
-    return JSON.parse(str)
-  } catch {
-    return null
+export async function loadConfig(file = CONFIG_PATH) {
+  const config = await readJson(file)
+  rememberSecret(config?.token)
+  if (config && process.platform !== 'win32') {
+    await fsp.chmod(file, 0o600).catch(() => { throw new Error('无法收紧配置权限') })
   }
+  return config
 }
 
-export async function saveConfig(config) {
-  await fsp.writeFile(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf-8')
-  console.log(`配置已保存: ${CONFIG_PATH}`)
+export async function saveConfig(config, file = CONFIG_PATH) {
+  rememberSecret(config.token)
+  try { await atomicJson(file, config, { privateFile: true }) }
+  catch { throw new Error('配置保存失败；旧配置已保留，请检查用户目录权限') }
+  console.log('配置已安全保存')
 }
 
 export function configPath() {
@@ -36,8 +40,8 @@ export function configPath() {
  *   ignoreAttachments: false
  * }
  */
-export async function initConfig({ nonInteractive = false, token, distDir } = {}) {
-  const existing = await loadConfig()
+export async function initConfig({ nonInteractive = false, token, distDir, mode, file = CONFIG_PATH } = {}) {
+  const existing = await loadConfig(file)
   let cfgToken = token ?? existing?.token
   let cfgDir = distDir ?? existing?.distDir
 
@@ -57,9 +61,11 @@ export async function initConfig({ nonInteractive = false, token, distDir } = {}
 
   const config = {
     ...(existing || {}),
+    mode: mode ?? (existing ? syncMode(existing) : 'recycle'),
     token: cfgToken,
     distDir: path.resolve(cfgDir),
   }
-  await saveConfig(config)
+  syncMode(config)
+  await saveConfig(config, file)
   return config
 }

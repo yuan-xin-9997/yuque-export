@@ -7,8 +7,11 @@ import { getUserBooks, filterBooks, getBookTocUuids } from './api.js'
 import { postprocessBook } from './postprocess.js'
 import { syncDeletions, repairMissingRawFiles } from './prune.js'
 import { sanitize } from './util.js'
+import { safePath, assertTree, validateRoot, atomicJson, readJson, syncMode } from './safety.js'
+import { rememberSecret, redact } from './secrets.js'
 
 const require = createRequire(import.meta.url)
+const log = (...args) => console.log(...args.map(redact))
 
 /** 缓存目录名（放在导出根目录下，存放 yuque-dl 的原始输出与增量状态） */
 export const RAW_DIR_NAME = '.yuque-export-raw'
@@ -118,28 +121,31 @@ function isNoiseLine(line) {
  * 运行 yuque-dl 下载单个知识库：
  * 抑制噪音日志，其余日志（WARN/ERROR）缩进透传。
  */
-function runYuqueDlBook(url, extraArgs, { onLine }) {
+export function runYuqueDlBook(url, extraArgs, { onLine, bin = resolveYuqueDlBin() }) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [resolveYuqueDlBin(), url, ...extraArgs], {
+    const child = spawn(process.execPath, [bin, url, ...extraArgs], {
       stdio: ['ignore', 'pipe', 'pipe'],
     })
     let buf = ''
+    let failed = false
     const handle = (chunk) => {
       buf += chunk.toString()
       const parts = buf.split(/\r|\n/)
       buf = parts.pop() // 末段可能不完整，留待下个 chunk
       for (const line of parts) {
         if (!line.trim()) continue
+        if (/\[ERROR\]|✕ 失败/.test(line)) failed = true
         if (isNoiseLine(line)) continue
-        onLine(line)
+        onLine('yuque-dl 报告诊断信息（已隐藏原文以保护登录凭据）')
       }
     }
     child.stdout.on('data', handle)
     child.stderr.on('data', handle)
-    child.on('error', reject)
-    child.on('exit', (code) => {
-      if (buf.trim() && !isNoiseLine(buf)) onLine(buf)
-      if (code === 0) resolve()
+    child.on('error', () => reject(new Error('无法启动 yuque-dl')))
+    child.on('close', (code) => {
+      if (buf.trim() && !isNoiseLine(buf)) onLine('yuque-dl 报告诊断信息（已隐藏原文以保护登录凭据）')
+      if (/\[ERROR\]|✕ 失败/.test(buf)) failed = true
+      if (code === 0 && !failed) resolve()
       else reject(new Error(`yuque-dl 退出码 ${code}`))
     })
   })
@@ -175,13 +181,38 @@ async function readProgressMap(bookRaw) {
 }
 
 /** 主流程：枚举 → 过滤 → 逐库（修复缺失 → 下载 → 删除同步 → 后处理） */
-export async function sync(config) {
-  const distDir = path.resolve(config.distDir)
+export async function sync(config, { runBook = runYuqueDlBook } = {}) {
+  rememberSecret(config.token)
+  const mode = syncMode(config)
+  if (mode === 'legacy') console.log('旧配置没有显式模式；保留数据，请预览后选择 --mode retain|recycle|mirror')
+  const distDir = await validateRoot(config.distDir)
+  await assertTree(distDir)
+  if (!config.preview) await fsp.mkdir(distDir, { recursive: true })
+  const ownerPath = path.join(distDir, '.yuque-export-owner.json')
+  const owner = await readJson(ownerPath, { version: 1, root: distDir, books: {} })
+  if (owner.version !== 1 || owner.root !== distDir || !owner.books || typeof owner.books !== 'object') {
+    throw new Error('输出目录归属记录无效或路径已变化；拒绝同步')
+  }
+  const lockPath = path.join(distDir, '.yuque-export.lock')
+  let lock
+  try {
+    if (!config.preview) {
+      lock = await fsp.open(lockPath, 'wx', 0o600)
+      await atomicJson(ownerPath, owner)
+    }
+    return await syncOwned(config, { runBook, distDir, owner, ownerPath, mode })
+  } finally {
+    if (lock) { await lock.close(); await fsp.unlink(lockPath) }
+  }
+}
+
+async function syncOwned(config, { runBook, distDir, owner, ownerPath, mode }) {
   const rawDir = path.join(distDir, RAW_DIR_NAME)
-  await fsp.mkdir(rawDir, { recursive: true })
+  if (!config.preview) await fsp.mkdir(rawDir, { recursive: true })
 
   const allBooks = await getUserBooks({ token: config.token, key: config.key })
   const books = filterBooks(allBooks, config)
+  await reportMissingBooks(owner, allBooks)
   if (books.length === 0) {
     console.log('没有匹配的知识库（检查配置中的 include/exclude）')
     return
@@ -191,7 +222,7 @@ export async function sync(config) {
   console.log(`知识库 ${books.length} 个（账号共 ${allBooks.length} 个）`)
 
   // 知识库级删除同步：raw 中存在但账号已不存在的知识库 → 移除 raw 与输出
-  await pruneDeletedBooks(distDir, rawDir, allBooks)
+  // Account-list absence never proves deletion: permissions can change.
 
   const commonArgs = ['-t', config.token, '-d', rawDir, '--incremental']
   if (config.key) commonArgs.push('-k', config.key)
@@ -209,13 +240,42 @@ export async function sync(config) {
   for (let i = 0; i < books.length; i++) {
     const b = books[i]
     const url = `https://www.yuque.com/${b.userLogin}/${b.slug}`
-    const bookRaw = path.join(rawDir, sanitize(b.name))
+    const name = sanitize(b.name)
+    if (!name || name.startsWith('.') || ['img', 'attachments'].includes(name.toLowerCase()) ||
+        books.some(other => other.id !== b.id && sanitize(other.name).toLowerCase() === name.toLowerCase())) {
+      throw new Error('知识库目录名不安全或重名；保留已有数据')
+    }
+    const bookRaw = await safePath(rawDir, name)
+    const bookOut = await safePath(distDir, name)
+    const existingOwner = Object.entries(owner.books).find(([id, entry]) => id !== String(b.id) && [entry.name, ...(entry.names || [])].some(n => n?.toLowerCase() === name.toLowerCase()))
+    if (existingOwner) throw new Error('目录属于其他知识库；拒绝覆盖')
+    if (owner.books[b.id]?.name !== undefined && owner.books[b.id].name !== name) {
+      console.log('      知识库已改名；旧目录保留，请核对后手动归档')
+    }
     console.log(`  [${i + 1}/${books.length}] ${b.name}`)
 
+    let tocBefore
+    try { tocBefore = await getBookTocUuids(url, { ...config, bookId: b.id }) }
+    catch (e) { console.log('      目录不可核验，跳过此库: ' + e.message); continue }
+    const previousState = await readJson(path.join(bookRaw, '.export-state.json'), {})
+    const cleanupScope = tocBefore.cleanupScope
+    if (previousState.cleanupScope && previousState.cleanupScope !== cleanupScope) {
+      console.log('      登录身份或知识库权限变化；保留数据并跳过此库')
+      continue
+    }
+    const scopeConfirmed = !!cleanupScope && previousState.cleanupScope === cleanupScope
+    if (!scopeConfirmed) console.log('      缺少可比对的完整权限状态；本次只建立状态，不执行删除')
+    if (config.preview) {
+      console.log('      删除预览（只读；实际同步会重新核验）')
+      const options = { mode, preview: true, confirmed: scopeConfirmed, tocUuids: tocBefore }
+      await syncDeletions(bookRaw, tocBefore, options)
+      await postprocessBook(bookRaw, bookOut, options)
+      continue
+    }
     // 下载前快照：用于对比出本次的新增/更新
     const oldProgress = await readProgressMap(bookRaw)
     // 修复：progress 记录已下载但文件缺失（如被杀毒软件隔离）→ 移除条目，本次重新下载
-    const repairedUuids = await repairMissingRawFiles(bookRaw)
+    const repairedUuids = await repairMissingRawFiles(bookRaw, bookOut)
 
     const meter = new ByteMeter(bookRaw, startTime)
     const live = new LiveLine()
@@ -226,10 +286,10 @@ export async function sync(config) {
     meter.start()
     let downloadOk = true
     try {
-      await runYuqueDlBook(url, commonArgs, {
+      await runBook(url, commonArgs, {
         onLine(line) {
           live.clear()
-          process.stdout.write(`${INDENT}${line}\n`)
+          process.stdout.write(`${INDENT}${redact(line)}\n`)
         },
       })
     } catch (e) {
@@ -250,15 +310,32 @@ export async function sync(config) {
       continue
     }
     let deletedTitles = []
+    let confirmed = false
     try {
-      const tocUuids = await getBookTocUuids(url, { token: config.token, key: config.key })
-      deletedTitles = await syncDeletions(bookRawFound, tocUuids)
+      const tocUuids = await getBookTocUuids(url, { ...config, bookId: b.id })
+      confirmed = scopeConfirmed && cleanupScope === tocUuids.cleanupScope &&
+        tocBefore.size === tocUuids.size && [...tocBefore].every(id => tocUuids.has(id))
+      if (!confirmed) throw new Error('下载前后目录发生变化；本次不清理')
+      await assertTree(bookRawFound)
+      const progress = await readJson(path.join(bookRawFound, 'progress.json'))
+      if (!Array.isArray(progress)) throw new Error('下载状态缺失；本次不清理')
+      for (const uuid of tocUuids.docs) {
+        const item = progress.find(i => i?.toc?.uuid === uuid)
+        if (!item?.path || !fs.existsSync(await safePath(bookRawFound, item.path))) {
+          confirmed = false
+          throw new Error('下载结果不完整；本次不清理')
+        }
+      }
+      deletedTitles = await syncDeletions(bookRawFound, tocUuids, { mode, confirmed })
     } catch (e) {
+      confirmed = false
       // TOC 获取失败时保守跳过删除同步，绝不误删
       console.log(`${INDENT}注意: 目录树获取失败，跳过删除同步（${e.message}）`)
     }
     try {
-      total.checked += await postprocessBook(bookRawFound, path.join(distDir, path.basename(bookRawFound)))
+      total.checked += await postprocessBook(bookRawFound, bookOut, { mode, confirmed, cleanupScope })
+      owner.books[b.id] = { ...owner.books[b.id], name, names: [...new Set([...(owner.books[b.id]?.names || []), owner.books[b.id]?.name, name].filter(Boolean))] }
+      await atomicJson(ownerPath, owner)
     } catch (e) {
       console.log(`${INDENT}失败: 后处理中断（${e.message}）`)
     }
@@ -301,19 +378,10 @@ export async function sync(config) {
   console.log(`  增量缓存: ${rawDir}（请勿删除或修改，否则增量失效）`)
 }
 
-/** 知识库级删除同步：raw 中存在但账号知识库列表已不存在的 → 移除 raw 与输出 */
-async function pruneDeletedBooks(distDir, rawDir, allBooks) {
-  const norm = (s) => s.replace(/[\\/:*?"<>|\n\r]/g, '_')
-  const activeBooks = new Set(allBooks.map((b) => norm(b.name)))
-  for (const entry of await fsp.readdir(rawDir).catch(() => [])) {
-    if (entry.startsWith('.')) continue
-    const entryStat = await fsp.stat(path.join(rawDir, entry)).catch(() => null)
-    if (!entryStat?.isDirectory()) continue
-    if (activeBooks.has(norm(entry))) continue
-    // 账号中已不存在的知识库（被删除），本地一并移除
-    await fsp.rm(path.join(rawDir, entry), { recursive: true, force: true })
-    const outDir = path.join(distDir, entry)
-    if (fs.existsSync(outDir)) await fsp.rm(outDir, { recursive: true, force: true })
-    console.log(`  已移除知识库: ${entry}（语雀端已删除）`)
+// This API has no authoritative deletion tombstone.
+async function reportMissingBooks(owner, allBooks) {
+  const active = new Set(allBooks.map(b => String(b.id)))
+  for (const [id, entry] of Object.entries(owner.books)) {
+    if (!active.has(id)) console.log('保留整库: ' + entry.name + '（列表中消失，无法区分删除与权限/枚举变化）')
   }
 }

@@ -1,137 +1,138 @@
 # yuque-export
 
-语雀知识库导出工具：保持目录结构导出为本地 Markdown，图片/附件本地化到笔记同名的 `.assets` 目录并采用相对引用，支持增量同步。**无需语雀会员。**
+将语雀知识库按目录导出为 Markdown，图片、附件放入笔记同名 `.assets` 目录，使用相对链接，适合在 Obsidian 中阅读。继续使用 [yuque-dl](https://github.com/gxr404/yuque-dl) 下载，保留增量、同名笔记去重、缺失文件修复与后处理。
 
-底层下载基于成熟开源项目 [yuque-dl](https://github.com/gxr404/yuque-dl)（语雀 Web API + Cookie），本工具在其上做封装：知识库枚举/过滤 + 后处理（纯标题命名、资源重组、链接改写、镜像同步）。
+## 从源码安装
 
-## 环境要求
-
-- Node.js ≥ 18.4（Windows / macOS / Linux）
-
-## 安装
+建议使用仍受维护的 Node.js 22 / 24；运行时下限与当前固定的上游版本一致，为 Node.js 18.4（Node.js 18 已停止维护）。运行测试请使用 Node.js 18.20.8 或 22 / 24。
 
 ```bash
+git clone https://github.com/yuan-xin-9997/yuque-export.git
 cd yuque-export
-npm install
-npm link   # 之后即可在任意位置使用 yuque-export 命令
+npm ci --ignore-scripts --registry=https://registry.npmjs.org
+npm test
+node bin/yuque-export.js --help
+npm link
 ```
 
-## 快速开始
+本说明面向源码安装，不要求 npm 上已有本版本。`npm link` 注册本地命令；也可以始终使用 `node bin/yuque-export.js`。MIT 许可证见 [LICENSE](LICENSE)。
 
 ```bash
-# 1. 初始化（按提示粘贴 token、选择导出目录）
-yuque-export init
-
-# 2. 查看账号下所有知识库（标记 √ 的为本次会同步的）
+yuque-export init --dir ./yuque-backup
 yuque-export repos
-
-# 3. 同步（首次全量，之后增量）
+yuque-export sync --preview
 yuque-export sync
 ```
 
-### sync 输出说明
+`init` 会在终端隐藏输入登录会话值。浏览器登录语雀后，从开发者工具 Application → Cookies → `https://www.yuque.com` 获取 `_yuque_session`。不要把会话值提交到 Git、粘贴进日志或截图。命令行 `--token` 仍兼容，但可能进入 shell 历史和本机进程参数，推荐交互输入。
 
-逐个知识库处理：先增量检查，有真实下载时才显示下载状态行（已下载量 · 速度），每个知识库列出本次的新增/更新/修复/删除明细，结束汇总各类篇数：
+## 配置与凭据
 
-```
-== 同步开始 ==
-知识库 9 个（账号共 9 个）
-  [1/9] 个人信息
-      无变化
-  [2/9] 数字生活
-      下载中: 12.5 MB · 2.1 MB/s          ← 仅在实际下载数据时出现，单行实时刷新
-      更新 2 篇: 摄影workflow、NAS备份方案
-      新增 1 篇: 新买的镜头
-      下载: 12.5 MB
-  [3/9] 技术
-      修复 1 篇（本地文件曾缺失，已重新下载）: 安全漏洞
-      删除 1 篇: 过时的笔记
-  ...
-== 同步完成 ==
-  检查 415 篇: 新增 1 · 更新 2 · 修复 1 · 删除 1
-  新增: 新买的镜头
-  更新: 摄影workflow、NAS备份方案
-  修复: 安全漏洞
-  删除: 过时的笔记
-  下载: 12.5 MB
-  导出目录: E:\YuqueExportLibrary
-  增量缓存: E:\YuqueExportLibrary\.yuque-export-raw（请勿删除或修改，否则增量失效）
-```
+配置位于 `os.homedir()` 下的 `.yuque-export.json`，Windows 使用当前用户的主目录。配置展示完全隐藏 token 和 Cookie 字段；上游原始诊断日志不透传，以免其输出会话值。配置仍为本地明文，请保护系统账号及备份。
 
-- 新增/更新：对比下载前后 yuque-dl 的 `progress.json`（按文档 uuid 与内容更新时间）
-- 修复：增量记录显示已下载、但本地文件缺失（如被杀毒软件隔离）的笔记，自动重新下载
-- 删除：以服务端目录树为准同步移除（目录树获取失败时保守跳过，绝不误删）
-- 下载量按磁盘实际落盘统计（yuque-dl 不提供字节级进度，总量无法预知，故显示已下载量与速度而非百分比）
+POSIX 首次写入使用 `0600`，读取/更新时收紧已有文件。保存采用同目录独占临时文件、刷盘、原子替换；失败或进程中断时旧配置保持完整。遗留临时文件不参与加载，可在确认没有写入进程后手动删除。配置损坏或无法读取会报错，不会当作首次运行覆盖。Windows 使用用户目录现有权限边界，不调整全局 umask 或目录 ACL。
 
-### 获取 Token
+以下配置示例不含登录凭据；先用 `init` 写入会话，再按需修改其他字段：
 
-私有知识库需要登录 Cookie：
-
-1. 浏览器登录 [yuque.com](https://www.yuque.com)
-2. `F12` 打开开发者工具 → **Application（应用）** → **Cookies** → `https://www.yuque.com`
-3. 找到 `_yuque_session`，复制它的值
-4. `yuque-export init` 时粘贴，或编辑 `~/.yuque-export.json`
-
-> token 过期后重新获取并更新配置即可（一般几个月有效）。
-
-## 配置文件 `~/.yuque-export.json`
-
-```jsonc
+```json
 {
-  "token": "_yuque_session 的值",
-  "key": "_yuque_session",              // 企业版语雀需改成对应的 Cookie 键名
-  "distDir": "D:\\yuque-backup",        // 导出根目录
-  "include": [],                        // 可选：知识库名/slug 白名单
-  "exclude": ["草稿本", "trash"],       // 可选：黑名单（与 include 二选一使用）
-  "toc": false,                         // 笔记开头生成目录
-  "hideFooter": false,                  // 不在笔记尾部追加更新时间/原文链接
-  "ignoreAttachments": false            // true=忽略附件；"mp4,pdf"=忽略指定后缀
+  "distDir": "D:\\yuque-backup",
+  "mode": "recycle",
+  "include": [],
+  "exclude": [],
+  "toc": false,
+  "hideFooter": false,
+  "ignoreAttachments": false
 }
 ```
 
-## 导出目录结构
+`key` 默认为 `_yuque_session`，可设置其他 Cookie 键名；当前账号枚举与 URL 仍固定为 `www.yuque.com`，不承诺企业私有域名可用。`include/exclude` 按知识库名称或 slug 匹配，忽略大小写；过滤掉的库保留。`ignoreAttachments` 可为 `true` 或扩展名字符串如 `mp4,pdf`。
 
+## 清理模式与旧配置升级
+
+| 配置 | 行为 |
+| --- | --- |
+| 新建配置 | 默认 `recycle`，符合条件的旧产物移入回收目录 |
+| `mode: "mirror"` | 显式镜像，符合条件的工具产物永久删除 |
+| `mode: "retain"` | 输出中保留旧笔记和附件；过时 raw 文档移入缓存回收目录 |
+| 旧配置没有模式 | `legacy` 待确认，提示选择模式，保留过时数据；普通 sync 不改写配置 |
+| 兼容字段 `mirror: true/false` | 分别保留显式镜像/保留意图；`mode` 优先 |
+
+`init` 更新旧配置时保留其他字段；缺失模式写为 `legacy`，不会批量改成新用户默认值。原有 `.export-state.json` 的额外字段也保留。版本 2 状态只有逻辑版本号，没有文件归属证明，因此不能授权清理旧文件。首次升级会记录可验证的新产物，未登记旧产物保留；冲突文件或本地修改不会被覆盖，需要先手动备份、移走冲突文件再同步。
+
+先审阅预览，再明确选择：
+
+```bash
+yuque-export sync --mode mirror --preview
+yuque-export sync --mode mirror
+# 如需持久保存选择（保持已有 token、目录、其他字段）
+yuque-export init --mode mirror
 ```
+
+命令行模式只作用于本次同步。`--preview` 不下载、不写配置、状态或输出，展示基于当前本地状态与远端目录可确认的 raw/输出清理候选。新增、更新、重命名及下载后才产生的附件变化无法完全预演；执行时重新核验条件。
+
+清理只作用于成功导出清单中有摘要且内容未被用户修改的文件。个人笔记、未登记文件、本地修改、用户空目录和回收区保留。资源副本仅在成功导出并持久化状态后，按实际复制的文件逐一回收空间；不递归删除整个资源目录。
+
+## 远端状态判断
+
+- 分页异常、重复条目、格式变化、计数不符、401、登录重定向等不会被当作空清单。
+- 文档移除需满足：有效的知识库身份、有效且计数一致的 TOC、同一登录身份及完整管理/私有阅读权限、已有可比对状态、下载前后 UUID 清单一致、活跃文档下载结果存在。权限收窄或切换账号时跳过该库。
+- 没有足够状态的首次同步只建立状态，不清理。缺少完整权限的只读账号可以导出，但不授权清理。未知 TOC 类型、计数语义变化会保守跳过此库。
+- TOC 移除仅说明文档退出当前完整目录，不证明远端内容被永久销毁。`mirror` 按这个目录语义镜像；需要保留历史请选 `retain` / `recycle`。
+- **整库从账号列表消失时始终保留 raw 和输出**，并说明无法区分删除、权限变化或枚举变化。当前 Web 接口没有可靠删除凭据，不自动销毁整库。
+- 笔记重命名按 UUID 处理，并尝试复用已有附件；知识库改名会创建新目录，旧目录与状态保留，核对后自行归档。
+- 上游即使退出码为 0，也可能有单篇失败；检测到 ERROR 诊断或不完整下载时阻止清理。后处理失败同样阻止输出清理。
+
+## 输出、归属与恢复
+
+```text
 distDir/
-├── .yuque-export-raw/          # yuque-dl 增量缓存（仅保留 md 与 progress.json，
-│   └── 知识库A/                 #   图片附件导出成功后即从缓存删除，不占额外空间）
-├── 知识库A/                     # ← 干净的导出结果（纯标题命名）
-│   ├── index.md                 # 知识库目录（链接已改写为干净路径）
-│   ├── 笔记一.md
-│   ├── 笔记一.assets/           # 笔记一的图片、附件、音视频（唯一拷贝在这里）
-│   │   └── image.png
-│   ├── 父文档/                   # 带子文档的笔记：正文为 父文档/index.md
-│   │   ├── index.md
-│   │   ├── 父文档.assets/
-│   │   └── 子笔记.md
-│   └── 子笔记.assets/
+├── .yuque-export-owner.json       # 根路径与知识库 ID/目录归属
+├── .yuque-export-raw/
+│   └── 知识库A/
+│       ├── progress.json         # yuque-dl 增量状态
+│       ├── .export-state.json    # 文件摘要、UUID 映射、权限状态
+│       └── .yuque-export-trash/  # 已回收 raw 文件（按需产生）
+└── 知识库A/
+    ├── index.md
+    ├── 笔记.md
+    ├── 笔记.assets/
+    ├── 父文档/
+    │   ├── index.md
+    │   ├── 父文档.assets/
+    │   └── 子笔记.md
+    └── .yuque-export-trash/      # 回收的输出文件（按需产生）
 ```
 
-- 同名笔记自动加序号：`标题.md`、`标题 (2).md`
-- Markdown 内资源引用均为相对路径（`./笔记一.assets/image.png`）
-- 语雀内文档间链接保留为语雀远程链接
+同名笔记自动加序号；语雀文档间链接保留远程链接。回收文件位于 `<所属库目录>/.yuque-export-trash/<随机批次>/<原相对路径>`，可检查后手动移回；工具不自动清空回收区。输出与 raw 的回收区独立。
 
-## 增量同步说明
+请使用专用子目录。同步拒绝磁盘根目录、用户主目录、系统目录、当前项目根目录及其危险祖先；拒绝越界、绝对状态路径、符号链接、junction 和多重硬链接文件。根路径/库归属不匹配时停止。目录内有链接时整个同步停止，先移走链接再运行。
 
-- `sync` 每次运行：只下载内容有更新的笔记（按语雀端更新时间比对），后处理仅复制有变化的文件，未变化笔记直接跳过
-- **删除同步**：每次 sync 以服务端目录树（TOC）为准——语雀端删除的文档、改名遗留的旧文件、整个被删除的知识库，本地都会同步移除；目录树获取失败时保守跳过，绝不误删
-- **自愈**：增量记录显示已下载、但本地文件缺失的笔记（如被杀毒软件隔离），自动重新下载
-- **空间优化**：笔记导出成功后，其图片/附件副本立即从 `.yuque-export-raw/` 缓存中删除（输出目录是唯一拷贝）；文档更新时 yuque-dl 会重新下载该文档的全部资源，不受影响
-- **请勿删除或修改 `distDir/.yuque-export-raw/`**，它是增量状态所在；删除后下次将全量重新下载
-- **导出目录由工具完全管理**：不要把个人文件放进导出目录（不在源里的文件会在同步时被清理）
-- 在语雀重命名笔记 = 本地文件同步改名（增量按文档 uuid 追踪，重命名后的首次同步会重新下载该篇内容）
+不要手动改写状态文件、让其他程序同时改动导出树，或把不同账号导出到同一目录。同步使用独占锁；进程被强制终止后，确认没有同步进程，再手动删除 `.yuque-export.lock`。移动整个导出树会触发路径归属校验，需要先备份并人工核对状态，工具不会自动重新认领。路径检查无法防御能同时篡改目录和状态的同用户恶意进程；本地权限边界仍由操作系统负责。
 
-## 命令一览
+## 命令与测试
 
-```
-yuque-export init [--token <t>] [--dir <path>]   初始化配置
-yuque-export repos                                列出账号知识库
-yuque-export sync [--token <t>] [--dir <path>]   增量同步
-yuque-export config                               查看当前配置（token 打码）
+```text
+yuque-export init [--dir <path>] [--mode retain|recycle|mirror]
+yuque-export repos
+yuque-export sync [--dir <path>] [--mode retain|recycle|mirror] [--preview]
+yuque-export config
 ```
 
-## 已知限制
+`sync` 按 uuid 与更新时间统计新增/更新，缺失 raw 或已登记输出资源时失效对应增量条目并重下；仅复制变化文件。下载量按落盘统计，无法给出准确百分比。
 
-- 语雀「画板」「数据表」类型文档暂不支持（yuque-dl 限制）
-- 表格类文档导出为 Markdown 表格，表格内图表不支持
-- 图片下载失败时该图保留为语雀远程链接（重跑 `sync` 可重试）
+```bash
+npm ci --ignore-scripts --registry=https://registry.npmjs.org
+npm test
+npm pack --dry-run
+```
+
+测试仅使用合成远端响应、运行时生成的随机凭据哨兵与临时目录，无真实账号。保留原有增量/同名/删除/修复测试，并增加配置权限与中断、迁移、模式、空/部分列表、异常、目录消失、重命名、附件修复、重复同步和外部哨兵保护测试。公共 CI 在 Windows / macOS / Linux 的 Node.js 18.20.8、22、24 上运行，不需要 secrets。
+
+## 上游兼容与边界
+
+当前固定 `yuque-dl 1.0.86`；核对了其发行包 CLI、`progress.json` 字段、TOC/权限类型及附件布局。其自身声明 Node.js ≥18.4。本工具不宣称兼容尚未验证的上游版本；升级需重新跑合成测试并复核字段/日志约定。语雀网页接口及内嵌 JSON 可能随时变化，不能保证长期稳定。
+
+画板、数据表暂不支持；普通表格按 Markdown 表格导出，表格内图表存在限制。图片下载失败时上游可能保留远程引用，本工具不会将其视作完整离线备份。仍保留远程引用的失败图片重试行为由上游增量状态决定，不保证仅重跑即可补齐。
+
+发布前需确认三平台 CI、在独立测试账号/测试知识库中人工验证当前语雀响应和上游附件行为、审阅依赖审计报告与包内容。尚未做真实登录验证；此修复不运行发布、部署、凭据轮换或共享历史改写。版本变更见 [CHANGELOG.md](CHANGELOG.md)。

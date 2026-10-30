@@ -1,15 +1,21 @@
-import { test } from 'node:test'
+import { test, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
 import fsp from 'node:fs/promises'
 import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
-import { postprocessBook } from '../src/postprocess.js'
-import { syncDeletions, repairMissingRawFiles } from '../src/prune.js'
+import { postprocessBook as processBook } from '../src/postprocess.js'
+import { syncDeletions as deleteEntries, repairMissingRawFiles } from '../src/prune.js'
+
+const roots = []
+afterEach(async () => { for (const root of roots.splice(0)) await fsp.rm(root, { recursive: true, force: true }) })
+const postprocessBook = (raw, out) => processBook(raw, out, { mode: 'mirror', confirmed: true })
+const syncDeletions = (raw, toc) => deleteEntries(raw, toc, { mode: 'mirror', confirmed: true })
 
 /** 构造模拟 yuque-dl 原始输出的夹具 */
 async function makeFixture() {
-  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'yuque-export-test-'))
+  const root = await fsp.realpath(await fsp.mkdtemp(path.join(os.tmpdir(), 'yuque-export-test-')))
+  roots.push(root)
   const raw = path.join(root, '知识库A')
   const out = path.join(root, 'out', '知识库A')
 

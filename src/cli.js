@@ -2,6 +2,8 @@ import path from 'node:path'
 import { loadConfig, initConfig } from './config.js'
 import { getUserBooks, filterBooks } from './api.js'
 import { sync } from './sync.js'
+import { rememberSecret, publicConfig, redact } from './secrets.js'
+import { syncMode } from './safety.js'
 
 const HELP = `
 yuque-export — 语雀知识库导出工具（基于 yuque-dl，无需语雀会员）
@@ -9,10 +11,11 @@ yuque-export — 语雀知识库导出工具（基于 yuque-dl，无需语雀会
 用法:
   yuque-export init [--token <_yuque_session>] [--dir <导出目录>]   初始化配置
   yuque-export repos                                                列出账号下所有知识库
-  yuque-export sync                                                 增量同步全部（受 include/exclude 影响）
+  yuque-export sync                                                 增量同步（--mode retain|recycle|mirror；--preview 只预览清理）
   yuque-export config                                               查看当前配置
 
 配置文件 ~/.yuque-export.json 支持的字段:
+  mode               retain 保留 / recycle 回收（新配置默认）/ mirror 显式镜像
   token              语雀 Cookie 中 _yuque_session 的值
   key                Cookie 键名（默认 _yuque_session，企业版需修改）
   distDir            导出根目录
@@ -58,7 +61,7 @@ export async function run(argv) {
   }
 
   if (command === 'init') {
-    await initConfig({ token: opts.token, distDir: opts.dir })
+    await initConfig({ token: opts.token, distDir: opts.dir, mode: opts.mode })
     console.log('\n下一步: 运行 yuque-export sync 开始同步')
     return
   }
@@ -69,11 +72,16 @@ export async function run(argv) {
     throw new Error('尚未初始化，请先运行: yuque-export init')
   }
   if (opts.token) config.token = opts.token
+  rememberSecret(config.token)
+  if (opts.mode) config.mode = opts.mode
+  syncMode(config)
+  config.preview = opts.preview === true
   if (opts.dir) config.distDir = path.resolve(opts.dir)
 
   if (command === 'config') {
-    const shown = { ...config, token: config.token ? `${config.token.slice(0, 8)}...` : '' }
-    console.log(JSON.stringify(shown, null, 2))
+    const shown = publicConfig(config)
+    delete shown.preview
+    console.log(redact(JSON.stringify(shown, null, 2)))
     return
   }
 

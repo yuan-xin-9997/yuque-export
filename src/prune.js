@@ -1,116 +1,58 @@
 import fsp from 'node:fs/promises'
 import fs from 'node:fs'
 import path from 'node:path'
+import { safePath, assertTree, atomicJson, readJson, digest, cleanOwned } from './safety.js'
 
-/**
- * 按服务端 TOC（当前目录树）同步删除：
- * - progress.json 中不在 TOC 的条目 = 语雀端已删除的文档 → 删除其 raw md 与资源副本，并从 progress 移除
- * - raw 中不在 progress 路径集合中的 md（改名遗留的旧文件、下载残留）→ 删除
- * - 清理删除后产生的空目录
- * @param {string} bookRaw 知识库的 raw 目录
- * @param {Set<string>} tocUuids 服务端 TOC 的 uuid 集合
- * @returns {Promise<string[]>} 被移除文档（DOC 类型）的标题列表
- */
-export async function syncDeletions(bookRaw, tocUuids) {
-  const progressPath = path.join(bookRaw, 'progress.json')
-  let progress
-  try {
-    progress = JSON.parse(await fsp.readFile(progressPath, 'utf-8'))
-    if (!Array.isArray(progress)) return []
-  } catch {
-    return []
+// Raw cleanup uses the previous export ledger and progress; never sweep arbitrary md.
+export async function syncDeletions(bookRaw, tocUuids, options = {}) {
+  const { mode = 'retain', preview = false, confirmed = false } = options
+  if (!confirmed || !(tocUuids instanceof Set)) return []
+  await assertTree(bookRaw)
+  const progressPath = await safePath(bookRaw, 'progress.json')
+  const progress = await readJson(progressPath)
+  if (!Array.isArray(progress)) return []
+  const state = await readJson(path.join(bookRaw, '.export-state.json'), {})
+  const kept = progress.filter(i => !i?.toc?.uuid || tocUuids.has(i.toc.uuid))
+  const removed = progress.filter(i => i?.toc?.uuid && !tocUuids.has(i.toc.uuid))
+  const activePaths = new Set(['index.md', ...kept.map(i => i.path).filter(Boolean)])
+  // TITLE paths are directories; their user files must never be recursively deleted.
+  const candidates = { ...state.rawFiles }
+  if (!state.rawFiles && removed.length) console.log('缺少历史 raw 文件归属清单；保留旧缓存')
+  const rawFiles = await cleanOwned(bookRaw, candidates, activePaths, { ...options, mode: mode === 'retain' ? 'recycle' : mode, preview })
+  // Retain keeps output notes, but stale raw entries must leave progress so that
+  // a reappearing remote document is downloaded again. Raw bytes go to recovery.
+  if (!preview && mode !== 'legacy') {
+    await atomicJson(progressPath, kept)
+    if (state.version) await atomicJson(path.join(bookRaw, '.export-state.json'), { ...state, rawFiles })
   }
-
-  const kept = []
-  const removed = []
-  for (const item of progress) {
-    if (item?.toc?.uuid && tocUuids.has(item.toc.uuid)) kept.push(item)
-    else removed.push(item)
-  }
-
-  // 已删除文档：移除 raw md 与资源副本
-  for (const item of removed) {
-    const p = item?.path
-    if (!p) continue
-    await fsp.rm(path.join(bookRaw, p), { recursive: true, force: true })
-    const uuid = item?.toc?.uuid
-    const dir = path.posix.dirname(p)
-    if (uuid) {
-      await fsp.rm(path.join(bookRaw, dir, 'img', uuid), { recursive: true, force: true })
-      await fsp.rm(path.join(bookRaw, dir, 'attachments', uuid), { recursive: true, force: true })
-    }
-  }
-
-  // 孤儿 md：磁盘上存在但不在 progress 路径集合（改名遗留、历史残留）
-  const keepPaths = new Set(kept.map((i) => i.path).filter(Boolean))
-  await (async function walk(dir) {
-    for (const e of await fsp.readdir(dir, { withFileTypes: true }).catch(() => [])) {
-      const abs = path.join(dir, e.name)
-      if (e.isDirectory()) {
-        await walk(abs)
-      } else if (e.name.endsWith('.md')) {
-        const rel = path.relative(bookRaw, abs).split(path.sep).join('/')
-        // 根 index.md 由 yuque-dl 每次运行重新生成，保留
-        if (rel === 'index.md') continue
-        if (!keepPaths.has(rel)) await fsp.rm(abs, { force: true })
-      }
-    }
-  })(bookRaw)
-
-  if (removed.length) {
-    try {
-      await fsp.writeFile(progressPath, JSON.stringify(kept))
-    } catch { /* raw 目录只读时忽略 */ }
-  }
-
-  await removeEmptyDirs(bookRaw)
-
-  // 仅报告文档类型（分组目录的删除不单独列出）
-  return removed
-    .filter((i) => String(i?.toc?.type || '').toUpperCase() === 'DOC')
-    .map((i) => i?.toc?.title || i?.path || '')
-    .filter(Boolean)
+  return preview || mode === 'retain' || mode === 'legacy' ? [] : removed
+    .filter(i => i.toc.type === 'DOC').map(i => i.toc.title || i.path)
 }
 
-/**
- * 修复增量状态：progress.json 中记录为已下载、但磁盘上已不存在的文档
- * （如被杀毒软件隔离、缓存文件被误删）→ 移除其条目，使 yuque-dl 本次重新下载。
- * @returns {Promise<Set<string>>} 被移除条目的 uuid 集合（供同步日志归为“修复”）
- */
-export async function repairMissingRawFiles(bookRaw) {
+export async function repairMissingRawFiles(bookRaw, bookOut) {
   const removedUuids = new Set()
-  const progressPath = path.join(bookRaw, 'progress.json')
-  try {
-    const progress = JSON.parse(await fsp.readFile(progressPath, 'utf-8'))
-    if (!Array.isArray(progress)) return removedUuids
-    const kept = []
-    for (const item of progress) {
-      // TITLE 条目的 path 是目录，DOC 条目是 md 文件，均以存在性判断
-      if (item?.path && !fs.existsSync(path.join(bookRaw, item.path))) {
-        if (item.toc?.uuid) removedUuids.add(item.toc.uuid)
-        continue
+  await assertTree(bookRaw)
+  const progressPath = await safePath(bookRaw, 'progress.json')
+  const progress = await readJson(progressPath)
+  if (!Array.isArray(progress)) return removedUuids
+  const state = await readJson(path.join(bookRaw, '.export-state.json'), {})
+  const kept = []
+  for (const item of progress) {
+    const target = item?.path ? await safePath(bookRaw, item.path) : null
+    let missingOutput = false
+    const clean = state.notePaths?.[item?.toc?.uuid]
+    if (bookOut && clean) {
+      const stem = path.posix.basename(clean) === 'index.md'
+        ? path.posix.basename(path.posix.dirname(clean)) : path.posix.basename(clean, '.md')
+      const prefix = path.posix.join(path.posix.dirname(clean), stem + '.assets') + '/'
+      for (const rel of Object.keys(state.files || {})) {
+        if ((rel === clean || rel.startsWith(prefix)) && !fs.existsSync(await safePath(bookOut, rel))) missingOutput = true
       }
-      kept.push(item)
     }
-    if (removedUuids.size > 0) await fsp.writeFile(progressPath, JSON.stringify(kept))
-  } catch { /* progress.json 缺失或损坏时无需修复 */ }
+    if (target && (!fs.existsSync(target) || missingOutput)) {
+      if (item.toc?.uuid) removedUuids.add(item.toc.uuid)
+    } else kept.push(item)
+  }
+  if (removedUuids.size) await atomicJson(progressPath, kept)
   return removedUuids
-}
-
-/** 递归删除空目录（不删知识库根目录本身） */
-async function removeEmptyDirs(dir, isRoot = true) {
-  let empty = true
-  for (const e of await fsp.readdir(dir, { withFileTypes: true }).catch(() => [])) {
-    if (e.isDirectory()) {
-      const subEmpty = await removeEmptyDirs(path.join(dir, e.name), false)
-      if (!subEmpty) empty = false
-    } else {
-      empty = false
-    }
-  }
-  if (empty && !isRoot) {
-    await fsp.rmdir(dir).catch(() => {})
-    return true
-  }
-  return empty
 }
