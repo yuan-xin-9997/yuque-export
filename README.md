@@ -28,7 +28,7 @@ node bin/yuque-export.js --help
 npm link
 ```
 
-本说明面向源码安装。npm 上的 `yuque-export` 是另一个项目，不是这个仓库；本项目目前不通过 npm 分发。`npm link` 注册本地命令；也可以始终使用 `node bin/yuque-export.js`。MIT 许可证见 [LICENSE](LICENSE)。
+本说明面向源码安装。npm 包名预留为 `yuque-export-cli`，首次发布完成前请按下面的步骤安装；npm 上的 `yuque-export` 是另一个项目，不是这个仓库。`npm link` 注册本地命令；也可以始终使用 `node bin/yuque-export.js`。MIT 许可证见 [LICENSE](LICENSE)。
 
 ```bash
 yuque-export init --dir ./yuque-backup
