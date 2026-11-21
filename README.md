@@ -1,8 +1,21 @@
 # yuque-export
 
-将语雀知识库按目录导出为 Markdown，图片、附件放入笔记同名 `.assets` 目录，使用相对链接，适合在 Obsidian 中阅读。继续使用 [yuque-dl](https://github.com/gxr404/yuque-dl) 下载，保留增量、同名笔记去重、缺失文件修复与后处理。
+[![test](https://github.com/yuan-xin-9997/yuque-export/actions/workflows/test.yml/badge.svg)](https://github.com/yuan-xin-9997/yuque-export/actions/workflows/test.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Node.js](https://img.shields.io/badge/node-%E2%89%A518.4-339933?logo=node.js&logoColor=white)](package.json)
 
-## 从源码安装
+把语雀知识库按目录导出为 Markdown，图片和附件落到笔记同名 `.assets`，正文使用相对链接。打开 Obsidian 就能读；第二次同步只处理变化；清理默认进回收区，不直接删。
+
+![导出后的目录结构：知识库、笔记、同名 .assets、增量缓存与回收区](docs/layout.png)
+
+- **整库导出**：按 TOC 保留目录层级，同名笔记自动加序号，不互相覆盖。
+- **附件本地化**：图片、附件下载到笔记同名的 `.assets/`，断网也能看。
+- **增量同步**：按 UUID 和文件摘要比对，改名、补图、删文都能跟上。
+- **清理可回退**：默认 `recycle` 进回收区，`mirror` 才真删，`--preview` 先看清单。
+
+下载层继续使用 [yuque-dl](https://github.com/gxr404/yuque-dl)，保留增量、同名笔记去重、缺失文件修复与后处理。
+
+## 安装
 
 建议使用仍受维护的 Node.js 22 / 24；运行时下限与当前固定的上游版本一致，为 Node.js 18.4（Node.js 18 已停止维护）。运行测试请使用 Node.js 18.20.8 或 22 / 24。
 
@@ -15,7 +28,7 @@ node bin/yuque-export.js --help
 npm link
 ```
 
-本说明面向源码安装，不要求 npm 上已有本版本。`npm link` 注册本地命令；也可以始终使用 `node bin/yuque-export.js`。MIT 许可证见 [LICENSE](LICENSE)。
+本说明面向源码安装。npm 上的 `yuque-export` 是另一个项目，不是这个仓库；本项目目前不通过 npm 分发。`npm link` 注册本地命令；也可以始终使用 `node bin/yuque-export.js`。MIT 许可证见 [LICENSE](LICENSE)。
 
 ```bash
 yuque-export init --dir ./yuque-backup
@@ -135,4 +148,4 @@ npm pack --dry-run
 
 画板、数据表暂不支持；普通表格按 Markdown 表格导出，表格内图表存在限制。图片下载失败时上游可能保留远程引用，本工具不会将其视作完整离线备份。仍保留远程引用的失败图片重试行为由上游增量状态决定，不保证仅重跑即可补齐。
 
-发布前需确认三平台 CI、在独立测试账号/测试知识库中人工验证当前语雀响应和上游附件行为、审阅依赖审计报告与包内容。尚未做真实登录验证；此修复不运行发布、部署、凭据轮换或共享历史改写。版本变更见 [CHANGELOG.md](CHANGELOG.md)。
+本轮已用真实账号验证登录、库枚举与只读预览（9 个知识库、460 篇，第二次同步 0 变化），三平台 CI 通过。正式发布前仍建议在独立测试知识库中再跑一次附件下载与清理流程，并审阅依赖审计报告与包内容。当前不做自动发布、部署、凭据轮换或共享历史改写。版本变更见 [CHANGELOG.md](CHANGELOG.md)。
