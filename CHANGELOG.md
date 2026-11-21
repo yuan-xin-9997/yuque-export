@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.3 — 2026-11-21
+
+- 发布 0.2.3 刷新 npm 包页面的 README：0.2.2 的 tarball 里仍是「首次发布完成前」的旧安装说明。
+- 功能与 0.2.2 相同，安装说明以 README 为准。
+
 ## 0.2.2 — 2026-11-21
 
 - 发布到 npm：`yuque-export-cli@0.2.2`，命令名仍为 `yuque-export`；npm 上的 `yuque-export` 属于另一个项目。
