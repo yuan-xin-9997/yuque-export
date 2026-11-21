@@ -34,6 +34,26 @@ export async function postprocessBook(bookRaw, bookOut, options = {}) {
   const uuidByPath = await loadUuidByPath(bookRaw)
   await buildMaps(bookRaw, '', '', fileMap, uuids)
 
+  // 改名残留：yuque-dl 增量重下新文件名却不删旧文件，同一 uuid 会留下多份，
+  // 逐份处理就会在输出里生成「新旧两篇」。只保留 progress.json 指向的版本。
+  const staleRaw = await staleRawVersions(bookRaw, fileMap, uuidByPath, uuids)
+  if (staleRaw.length) {
+    console.log(`      清理旧版本原始文件 ${staleRaw.length} 个（改名残留）`)
+    for (const rel of staleRaw) {
+      console.log(`      清理 旧版本: ${rel}`)
+      if (preview) continue
+      const target = await safePath(bookRaw, rel)
+      await fsp.rm(target, { force: true })
+      fileMap.delete(rel)
+      // 只回收因本次删除而变空的上级目录，绝不扫描用户目录
+      let parent = path.dirname(target)
+      while (parent !== path.resolve(bookRaw)) {
+        try { await fsp.rmdir(parent) } catch { break }
+        parent = path.dirname(parent)
+      }
+    }
+  }
+
   // 状态文件记录后处理逻辑版本；版本变化时全量重扫（防止旧逻辑输出被跳过）
   const stateFile = path.join(bookRaw, '.export-state.json')
   const state = await readJson(stateFile, {})
@@ -219,6 +239,46 @@ async function loadUuidByPath(bookRaw) {
     }
   } catch { /* 忽略 */ }
   return map
+}
+
+/** 从 raw 相对路径推断所属笔记 uuid：`标题_<uuid>.md` 或 `<标题>_<uuid>/index.md` */
+function uuidOfRawPath(rel, uuids) {
+  const base = path.posix.basename(rel)
+  const stem = base === 'index.md'
+    ? path.posix.basename(path.posix.dirname(rel))
+    : base.replace(/\.md$/, '')
+  for (const uuid of uuids) {
+    if (stem.endsWith('_' + uuid)) return uuid
+  }
+  return null
+}
+
+/**
+ * 找出改名后被留下的旧 raw 文件：同一 uuid 只应保留 progress.json 指向的路径。
+ * 只有该路径对应的文件确实存在时才认定其它版本是残留，避免把唯一副本删掉。
+ */
+async function staleRawVersions(bookRaw, fileMap, uuidByPath, uuids) {
+  if (!uuids?.size) return []
+  const currentByUuid = new Map()
+  for (const [rel, uuid] of uuidByPath) {
+    if (!currentByUuid.has(uuid)) currentByUuid.set(uuid, new Set())
+    const paths = currentByUuid.get(uuid)
+    paths.add(rel)
+    // progress 记录的是目录时（TITLE / 带子文档），其 index.md 属于该目录，不能算残留
+    paths.add(`${rel}/index.md`)
+  }
+  const stale = []
+  for (const rel of fileMap.keys()) {
+    const uuid = uuidOfRawPath(rel, uuids)
+    const current = uuid ? currentByUuid.get(uuid) : null
+    if (!current || current.has(rel)) continue
+    let currentExists = false
+    for (const currentRel of current) {
+      if (fs.existsSync(await safePath(bookRaw, currentRel))) { currentExists = true; break }
+    }
+    if (currentExists) stale.push(rel)
+  }
+  return stale
 }
 
 /**

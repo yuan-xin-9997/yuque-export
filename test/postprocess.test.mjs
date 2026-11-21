@@ -270,6 +270,72 @@ test('删除同步：孤儿 md（改名遗留）被清理', async () => {
   assert.ok(!fs.existsSync(path.join(out, '笔记一.md')))
 })
 
+test('后处理：progress 记录目录时其 index.md 不算改名残留', async () => {
+  const { raw, out, U2 } = await makeFixture()
+  await fsp.writeFile(path.join(raw, `分组_${U2}`, 'index.md'), '# 分组\n')
+
+  await postprocessBook(raw, out)
+  assert.ok(fs.existsSync(path.join(raw, `分组_${U2}`, 'index.md')))
+  assert.ok(fs.existsSync(path.join(out, '分组', 'index.md')))
+})
+
+test('后处理：改名残留的旧 raw 只保留 progress 指向的版本', async () => {
+  const { raw, out, U1 } = await makeFixture()
+  await postprocessBook(raw, out)
+
+  // 模拟 yuque-dl 改名后写入新文件名、旧文件未删除（同一 uuid 两份）
+  await fsp.writeFile(path.join(raw, `新标题_${U1}.md`), '# 新标题\n')
+  const progress = JSON.parse(await fsp.readFile(path.join(raw, 'progress.json'), 'utf-8'))
+  const entry = progress.find((i) => i.toc.uuid === U1)
+  entry.path = `新标题_${U1}.md`
+  entry.toc.title = '新标题'
+  await fsp.writeFile(path.join(raw, 'progress.json'), JSON.stringify(progress))
+
+  // 预览只报告，不删除
+  await processBook(raw, out, { mode: 'mirror', confirmed: true, preview: true })
+  assert.ok(fs.existsSync(path.join(raw, `笔记一_${U1}.md`)))
+
+  await postprocessBook(raw, out)
+  assert.ok(!fs.existsSync(path.join(raw, `笔记一_${U1}.md`)))
+  assert.ok(fs.existsSync(path.join(raw, `新标题_${U1}.md`)))
+  assert.ok(fs.existsSync(path.join(out, '新标题.md')))
+  // 输出里不再保留旧标题，也不再生出第二份
+  assert.ok(!fs.existsSync(path.join(out, '笔记一.md')))
+  assert.ok(!fs.existsSync(path.join(out, '笔记一.assets')))
+})
+
+test('后处理：progress 指向的当前文件缺失时保留旧版本', async () => {
+  const { raw, out, U1 } = await makeFixture()
+  const progress = JSON.parse(await fsp.readFile(path.join(raw, 'progress.json'), 'utf-8'))
+  progress.find((i) => i.toc.uuid === U1).path = `还没下载_${U1}.md`
+  await fsp.writeFile(path.join(raw, 'progress.json'), JSON.stringify(progress))
+
+  await postprocessBook(raw, out)
+  // 唯一存在的副本不能被当成残留删掉
+  assert.ok(fs.existsSync(path.join(raw, `笔记一_${U1}.md`)))
+})
+
+test('后处理：带子文档的文档改名后旧目录内容被清理', async () => {
+  const { raw, out, U4, U5 } = await makeFixture()
+  await postprocessBook(raw, out)
+
+  const oldDir = path.join(raw, `父文档_${U4}`)
+  const newDir = path.join(raw, `新父文档_${U4}`)
+  await fsp.cp(oldDir, newDir, { recursive: true })
+  const progress = JSON.parse(await fsp.readFile(path.join(raw, 'progress.json'), 'utf-8'))
+  for (const item of progress) {
+    if (item.toc.uuid === U4) { item.path = `新父文档_${U4}/index.md`; item.toc.title = '新父文档' }
+    if (item.toc.uuid === U5) item.path = `新父文档_${U4}/子笔记2_${U5}.md`
+  }
+  await fsp.writeFile(path.join(raw, 'progress.json'), JSON.stringify(progress))
+
+  await postprocessBook(raw, out)
+  assert.ok(!fs.existsSync(path.join(oldDir, 'index.md')))
+  assert.ok(fs.existsSync(path.join(newDir, 'index.md')))
+  assert.ok(fs.existsSync(path.join(out, '新父文档', 'index.md')))
+  assert.ok(!fs.existsSync(path.join(out, '父文档')))
+})
+
 test('删除同步：progress.json 缺失时安全返回', async () => {
   const { root, raw } = await makeFixture()
   await fsp.rm(path.join(raw, 'progress.json'))
