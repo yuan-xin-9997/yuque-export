@@ -10,7 +10,7 @@
     "node": ">=18.4"
   },
   "scripts": {
-    "test": "node --test"
+    "test": "node test/postprocess.test.mjs && node test/protection.test.mjs"
   },
   "dependencies": {
     "yuque-dl": "1.0.86"
