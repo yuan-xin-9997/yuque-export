@@ -1,9 +1,9 @@
 # Changelog
 
-## 未发布
+## 0.2.2 — 2026-11-21
 
-- npm 包名改为 `yuque-export-cli`，避开 npm 上同名的另一个项目；首次发布待执行。
-- README 安装说明同步包名与源码安装的先后关系。
+- 发布到 npm：`yuque-export-cli@0.2.2`，命令名仍为 `yuque-export`；npm 上的 `yuque-export` 属于另一个项目。
+- README 安装说明改为 npm 优先，源码安装保留为备选。
 
 ## 0.2.1 — 2026-11-21
 

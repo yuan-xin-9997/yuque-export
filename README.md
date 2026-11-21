@@ -17,7 +17,15 @@
 
 ## 安装
 
-建议使用仍受维护的 Node.js 22 / 24；运行时下限与当前固定的上游版本一致，为 Node.js 18.4（Node.js 18 已停止维护）。运行测试请使用 Node.js 18.20.8 或 22 / 24。
+```bash
+npm install -g yuque-export-cli
+# 或者不安装，直接运行
+npx yuque-export-cli --help
+```
+
+需要 Node.js 18.4 及以上，建议 22 或 24（Node.js 18 已停止维护）。首次从源码运行测试请使用 Node.js 18.20.8 或 22 / 24。
+
+也可以从源码安装：
 
 ```bash
 git clone https://github.com/yuan-xin-9997/yuque-export.git
@@ -28,7 +36,7 @@ node bin/yuque-export.js --help
 npm link
 ```
 
-本说明面向源码安装。npm 包名预留为 `yuque-export-cli`，首次发布完成前请按下面的步骤安装；npm 上的 `yuque-export` 是另一个项目，不是这个仓库。`npm link` 注册本地命令；也可以始终使用 `node bin/yuque-export.js`。MIT 许可证见 [LICENSE](LICENSE)。
+npm 上的 `yuque-export` 是另一个项目，不是这个仓库；本仓库的 npm 包名是 `yuque-export-cli`，命令名仍是 `yuque-export`。MIT 许可证见 [LICENSE](LICENSE)。
 
 ```bash
 yuque-export init --dir ./yuque-backup
