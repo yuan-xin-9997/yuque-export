@@ -340,6 +340,90 @@ function dedupe(name, used) {
 }
 
 /**
+ * 扫描 md 中的内联链接与图片，返回 URL 片段的位置。
+ * yuque-dl 会把附件原名直接写进链接（可能带空格或成对括号，如 `名录(上海).txt`），
+ * 因此不能按空白或 `)` 切分，必须逐字符按括号配对扫描。
+ * @returns {{urlStart:number,urlEnd:number,close:number,bracket:number,textStart:number,textEnd:number}[]}
+ */
+function scanInlineLinks(content) {
+  const links = []
+  let cursor = 0
+  for (;;) {
+    const closeBracket = content.indexOf('](', cursor)
+    if (closeBracket === -1) break
+    const url = parseLinkUrl(content, closeBracket + 2)
+    if (!url) { cursor = closeBracket + 2; continue }
+    const bracket = findOpenBracket(content, closeBracket)
+    links.push({
+      urlStart: url.start,
+      urlEnd: url.end,
+      close: url.close,
+      bracket,
+      textStart: bracket === -1 ? closeBracket : bracket + 1,
+      textEnd: closeBracket,
+    })
+    cursor = url.close + 1
+  }
+  return links
+}
+
+/** 从 `](` 之后解析 URL：跳过空白、支持 `<...>`、允许成对括号与空格、剥离 `"标题"` */
+function parseLinkUrl(content, from) {
+  let i = from
+  while (content[i] === ' ' || content[i] === '\t') i++
+  const start = i
+  if (content[i] === '<') {
+    let end = -1
+    for (let j = i + 1; j < content.length; j++) {
+      if (content[j] === '\\') { j++; continue }
+      if (content[j] === '\n') return null
+      if (content[j] === '>') { end = j; break }
+    }
+    if (end === -1) return null
+    let k = end + 1
+    while (content[k] === ' ' || content[k] === '\t') k++
+    if (content[k] !== ')') return null
+    return { start: i + 1, end, close: k }
+  }
+  let depth = 0
+  let close = -1
+  for (; i < content.length; i++) {
+    const ch = content[i]
+    if (ch === '\\') { i++; continue }
+    if (ch === '\n') return null
+    if (ch === '(') { depth++; continue }
+    if (ch !== ')') continue
+    if (depth > 0) { depth--; continue }
+    close = i
+    break
+  }
+  if (close === -1) return null
+  let end = close
+  while (end > start && /\s/.test(content[end - 1])) end--
+  const title = content.slice(start, end).match(/\s+(?:"[^"]*"|'[^']*')$/)
+  if (title) {
+    end -= title[0].length
+    while (end > start && /\s/.test(content[end - 1])) end--
+  }
+  if (end === start) return null
+  return { start, end, close }
+}
+
+/** 由 `](` 中的 `]` 向左找到配对的 `[`（用于死链降级为纯文本） */
+function findOpenBracket(content, closeBracket) {
+  let depth = 0
+  for (let i = closeBracket; i >= 0; i--) {
+    const ch = content[i]
+    if (ch === ']') { depth++; continue }
+    if (ch === '\\') { i--; continue }
+    if (ch !== '[') continue
+    depth--
+    if (depth === 0) return i
+  }
+  return -1
+}
+
+/**
  * 改写 md 中相对引用的 img/、attachments/ 资源链接：
  * 将资源复制到 `<笔记>.assets/`，并把链接改为指向新位置的相对路径。
  * 安全网：若 raw 中的资源已被清理（笔记未变化或历史版本处理过），
@@ -350,15 +434,12 @@ async function relocateAssets(content, { bookRaw, bookOut, rawRel, cleanRel, ass
   const cleanMdDir = path.posix.dirname(cleanRel)
   const outAssetsRel = path.posix.join(cleanMdDir, assetsName)
   const names = new Map()
-  const refs = []
-  content = content.replace(/(!?\[[^\]]*\]\(\s*)([^)\s]+)([^)]*\))/g, (full, pre, ref, post) => {
-    refs.push(ref)
-    return pre + '\x00' + (refs.length - 1) + '\x00' + post
-  })
-  const rewritten = []
-  for (const ref of refs) {
+  const parts = []
+  let last = 0
+  for (const link of scanInlineLinks(content)) {
+    const ref = content.slice(link.urlStart, link.urlEnd)
     const match = ref.match(/^\.?\/?(img|attachments)\/(.+)$/)
-    if (!match) { rewritten.push(ref); continue }
+    if (!match) continue
     const assetPath = decodeURIComponent(match[2].replace(/\\/g, '/'))
     const rawAssetAbs = await safePath(bookRaw, path.posix.join(rawMdDir, match[1]) + '/' + assetPath)
     let outName = names.get(assetPath)
@@ -386,21 +467,31 @@ async function relocateAssets(content, { bookRaw, bookOut, rawRel, cleanRel, ass
     if (source === rawAssetAbs) copiedRaw.set(path.relative(bookRaw, source).split(path.sep).join('/'), await digest(outAbs))
     keepSet.add(outRel)
     produced.add(outRel)
-    rewritten.push(toMdLink(path.posix.relative(cleanMdDir, outRel)))
+    parts.push(content.slice(last, link.urlStart), toMdLink(path.posix.relative(cleanMdDir, outRel)))
+    last = link.urlEnd
   }
-  return content.replace(/\x00(\d+)\x00/g, (full, idx) => rewritten[Number(idx)])
+  parts.push(content.slice(last))
+  return parts.join('')
 }
 
 /** index.md 中指向其他笔记的链接改写（uuid 命名 -> 干净命名）；指向已删除文档的死链降级为纯文本 */
 function rewriteDocLinks(content, fileMap) {
-  return content.replace(/(\[([^\]]*)\]\(\s*)([^)\s]+)(\s*(?: "[^"]*")?\))/g, (full, pre, text, ref, post) => {
-    if (/^https?:/.test(ref)) return full
+  const parts = []
+  let last = 0
+  for (const link of scanInlineLinks(content)) {
+    const ref = content.slice(link.urlStart, link.urlEnd)
+    if (/^https?:/.test(ref)) continue
     const decoded = ref.replace(/%20/g, ' ').replace(/^\.\//, '')
     const clean = fileMap.get(decoded)
-    if (clean) return `${pre}${toMdLink(clean)}${post}`
-    if (decoded.endsWith('.md')) return text // 文档已删除：保留标题文字，去掉死链
-    return full
-  })
+    // 文档已删除：保留标题文字，去掉死链
+    const dead = !clean && decoded.endsWith('.md') && link.bracket !== -1
+    if (!clean && !dead) continue
+    parts.push(content.slice(last, dead ? link.bracket : link.urlStart))
+    parts.push(dead ? content.slice(link.textStart, link.textEnd) : toMdLink(clean))
+    last = dead ? link.close + 1 : link.urlEnd
+  }
+  parts.push(content.slice(last))
+  return parts.join('')
 }
 
 /** 二进制文件复制（内容有变化才写，并保留源文件 mtime 供下次比对） */

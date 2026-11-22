@@ -387,3 +387,72 @@ test('后处理：源内容改变但 mtime 相同仍处理新内容', async () =
   await postprocessBook(raw, out)
   assert.equal(await fsp.readFile(path.join(out, '笔记一.md'), 'utf8'), '# 新正文\n')
 })
+
+/** 构造附件名含空格/括号的夹具：yuque-dl 会把原名原样写进链接 */
+async function makeAssetNameFixture() {
+  const root = await fsp.realpath(await fsp.mkdtemp(path.join(os.tmpdir(), 'yuque-export-name-')))
+  roots.push(root)
+  const raw = path.join(root, '知识库B')
+  const out = path.join(root, 'out', '知识库B')
+  const U = 'abcdefghij0123456'
+  const title = '附件 名 (1)' // 标题本身也带空格与括号，用于验证 index.md 链接改写
+
+  const spaced = '2026-01-06-GS Asia Views_ 2026 Outlook.pdf'
+  const paren = '名录(上海).txt'
+  const mixed = '新联酒店菜单设计文件  2024年 11.20.pdf'
+  const image = 'pic (1).png'
+
+  await fsp.mkdir(path.join(raw, 'attachments', U), { recursive: true })
+  await fsp.mkdir(path.join(raw, 'img', U), { recursive: true })
+  await fsp.writeFile(path.join(raw, `附件 名 (1)_${U}.md`), [
+    '# 附件 名 (1)',
+    '',
+    `[附件: GS](./attachments/${U}/${spaced})`,
+    `[附件: 名录](./attachments/${U}/${paren})`,
+    `[附件: 菜单](./attachments/${U}/${mixed})`,
+    `![图](./img/${U}/${image})`,
+    '',
+  ].join('\n'))
+  for (const [dir, name, data] of [
+    ['attachments', spaced, 'PDFDATA'],
+    ['attachments', paren, 'TXTDATA'],
+    ['attachments', mixed, 'PDFDATA2'],
+    ['img', image, 'PNGDATA'],
+  ]) await fsp.writeFile(path.join(raw, dir, U, name), data)
+
+  await fsp.writeFile(path.join(raw, 'index.md'), `# 知识库B\n\n- [${title}](附件 名 (1)_${U}.md)\n`)
+  await fsp.writeFile(path.join(raw, 'progress.json'), JSON.stringify([
+    { path: `附件 名 (1)_${U}.md`, toc: { uuid: U, type: 'DOC', title } },
+  ]))
+  return { root, raw, out }
+}
+
+test('后处理：附件名含空格和括号时仍能定位资源并改写链接', async () => {
+  const { raw, out } = await makeAssetNameFixture()
+  const n = await postprocessBook(raw, out)
+  assert.equal(n, 2) // 笔记 + 知识库 index
+
+  const assets = path.join(out, '附件 名 (1).assets')
+  assert.ok(fs.existsSync(path.join(assets, '2026-01-06-GS Asia Views_ 2026 Outlook.pdf')))
+  assert.ok(fs.existsSync(path.join(assets, '名录(上海).txt')))
+  assert.ok(fs.existsSync(path.join(assets, '新联酒店菜单设计文件  2024年 11.20.pdf')))
+  assert.ok(fs.existsSync(path.join(assets, 'pic (1).png')))
+
+  const md = await fsp.readFile(path.join(out, '附件 名 (1).md'), 'utf-8')
+  assert.match(md, /\]\(附件%20名%20\(1\)\.assets\/2026-01-06-GS%20Asia%20Views_%202026%20Outlook\.pdf\)/)
+  assert.match(md, /\]\(附件%20名%20\(1\)\.assets\/名录\(上海\)\.txt\)/)
+  assert.match(md, /\]\(附件%20名%20\(1\)\.assets\/新联酒店菜单设计文件%20%202024年%2011\.20\.pdf\)/)
+  assert.match(md, /!\[图\]\(附件%20名%20\(1\)\.assets\/pic%20\(1\)\.png\)/)
+  // 残留的 raw 引用已全部改写
+  assert.ok(!md.includes('](./attachments/'))
+  assert.ok(!md.includes('](./img/'))
+
+  // index.md 中带空格/括号的文档链接同样改写
+  const summary = await fsp.readFile(path.join(out, 'index.md'), 'utf-8')
+  assert.match(summary, /- \[附件 名 \(1\)\]\(附件%20名%20\(1\)\.md\)/)
+
+  // 幂等：第二次运行不再改动
+  const before = await fsp.readFile(path.join(out, '附件 名 (1).md'), 'utf-8')
+  await postprocessBook(raw, out)
+  assert.equal(await fsp.readFile(path.join(out, '附件 名 (1).md'), 'utf-8'), before)
+})
